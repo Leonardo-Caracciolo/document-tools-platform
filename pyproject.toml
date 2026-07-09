@@ -22,6 +22,21 @@ include = ["app*"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import ordering)
+    "UP",  # pyupgrade (modern Python idioms)
+    "B",   # flake8-bugbear (common bug patterns)
+    "SIM", # flake8-simplify
+]
+
 # NOTE: [dependency-groups] follows PEP 735 and requires pip>=25.1 to install
 # directly (e.g. `pip install --group lint` / `pip install --group test`).
 # On pip<25.1, install the package in editable mode and add the tooling

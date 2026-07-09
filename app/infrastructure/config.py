@@ -88,7 +88,7 @@ class AppConfig:
     log_level: str
 
     @classmethod
-    def load(cls) -> "AppConfig":
+    def load(cls) -> AppConfig:
         """Load `.env` into the environment and build a typed `AppConfig`.
 
         Raises:
