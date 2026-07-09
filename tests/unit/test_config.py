@@ -5,20 +5,11 @@ from __future__ import annotations
 import pytest
 
 from app.core.exceptions import ConfigError
-from app.infrastructure.config import AppConfig
+from app.infrastructure.config import ALL_ENV_KEYS, AppConfig
 
 
 def _clear_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in (
-        "LOG_LEVEL",
-        "OCR_PROVIDER",
-        "TESSERACT_PATH",
-        "DOC_CONVERTER_PROVIDER",
-        "SQLSERVER_HOST",
-        "SQLSERVER_DB",
-        "SQLSERVER_USER",
-        "SQLSERVER_PASSWORD",
-    ):
+    for key in ALL_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
 
 

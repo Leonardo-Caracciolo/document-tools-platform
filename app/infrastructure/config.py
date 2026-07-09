@@ -25,6 +25,25 @@ from app.core.exceptions import ConfigError
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DOTENV_PATH = _REPO_ROOT / ".env"
 
+#: Keys required today (fail-fast if missing).
+REQUIRED_ENV_KEYS: tuple[str, ...] = ("LOG_LEVEL",)
+
+#: Sprint 1+ provider keys — optional until their provider ships.
+OPTIONAL_ENV_KEYS: tuple[str, ...] = (
+    "OCR_PROVIDER",
+    "TESSERACT_PATH",
+    "DOC_CONVERTER_PROVIDER",
+    "SQLSERVER_HOST",
+    "SQLSERVER_DB",
+    "SQLSERVER_USER",
+    "SQLSERVER_PASSWORD",
+)
+
+#: Single source of truth for every env key this module reads — tests use
+#: this to clear state instead of re-listing the keys, so a renamed or
+#: added key can't silently drift out of sync between prod code and tests.
+ALL_ENV_KEYS: tuple[str, ...] = REQUIRED_ENV_KEYS + OPTIONAL_ENV_KEYS
+
 
 def _require(key: str) -> str:
     """Return `os.environ[key]` or raise `ConfigError` naming the key."""
