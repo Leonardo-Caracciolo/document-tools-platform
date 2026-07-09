@@ -34,6 +34,7 @@ select = [
     "I",   # isort (import ordering)
     "UP",  # pyupgrade (modern Python idioms)
     "B",   # flake8-bugbear (common bug patterns)
+    "BLE", # flake8-blind-except (bare `except Exception` must be justified)
     "SIM", # flake8-simplify
 ]
 
