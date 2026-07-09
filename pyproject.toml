@@ -19,6 +19,9 @@ test = ["pytest"]
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 # NOTE: [dependency-groups] follows PEP 735 and requires pip>=25.1 to install
 # directly (e.g. `pip install --group lint` / `pip install --group test`).
 # On pip<25.1, install the package in editable mode and add the tooling
