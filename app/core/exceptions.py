@@ -3,6 +3,11 @@
 `ConfigError` is raised by `app.infrastructure.config` when required
 configuration is missing or invalid, so the application fails fast at
 startup instead of continuing with an undefined value.
+
+`PDFCorruptoError`, `ArchivoProtegidoError`, `ContrasenaInvalidaError`, and
+`EntradaInvalidaError` are raised by `app.core.services.pdf_service` so
+`pikepdf`/`img2pdf`/`Pillow` failures never reach callers as raw
+tracebacks.
 """
 
 from __future__ import annotations
@@ -10,3 +15,19 @@ from __future__ import annotations
 
 class ConfigError(Exception):
     """Raised when required application configuration is missing or invalid."""
+
+
+class PDFCorruptoError(Exception):
+    """Raised when a PDF input is structurally malformed or unparsable."""
+
+
+class ArchivoProtegidoError(Exception):
+    """Raised when an operation hits an already password-protected PDF."""
+
+
+class ContrasenaInvalidaError(Exception):
+    """Raised when an unlock password does not match the PDF's password."""
+
+
+class EntradaInvalidaError(Exception):
+    """Raised when caller-supplied input (paths, pages, images) is invalid."""
