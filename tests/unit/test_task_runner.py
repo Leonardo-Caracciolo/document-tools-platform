@@ -25,18 +25,33 @@ class _FakeScheduler:
     invokes `callback` on its own — the test drives ticks explicitly via
     `pump()`, synchronously and immediately (no delay, no sleep), which is
     what proves callbacks run on the thread that calls `pump()`.
+
+    Each scheduled call is given an opaque integer handle so tests can
+    exercise `cancel_scheduled`-style APIs (mirrors `root.after` returning
+    a handle that `root.after_cancel(handle)` consumes).
     """
 
     def __init__(self) -> None:
-        self._pending: list[Callable[[], None]] = []
+        self._pending: dict[int, Callable[[], None]] = {}
+        self._next_handle = 0
+        self.cancelled_handles: list[int] = []
 
-    def __call__(self, delay_ms: int, callback: Callable[[], None]) -> None:
+    def __call__(self, delay_ms: int, callback: Callable[[], None]) -> int:
         del delay_ms  # unused — this fake ignores real timing entirely
-        self._pending.append(callback)
+        handle = self._next_handle
+        self._next_handle += 1
+        self._pending[handle] = callback
+        return handle
+
+    def cancel(self, handle: int) -> None:
+        """Mirror `root.after_cancel(handle)` — drop a pending callback."""
+        self.cancelled_handles.append(handle)
+        self._pending.pop(handle, None)
 
     def pump(self) -> None:
         """Run every callback scheduled so far, once, synchronously."""
-        callbacks, self._pending = self._pending, []
+        callbacks = list(self._pending.values())
+        self._pending = {}
         for callback in callbacks:
             callback()
 
@@ -185,3 +200,124 @@ def test_shutdown_rejects_new_submissions() -> None:
 
     with pytest.raises(RuntimeError):
         runner.submit(lambda: 1)
+
+
+def test_submit_from_non_owner_thread_raises() -> None:
+    """`submit()` enforces the thread-affinity invariant `_pending` and
+    `_tick_scheduled` rely on for lock-free access (Fix A)."""
+    scheduler = _FakeScheduler()
+    runner = TaskRunner(scheduler=scheduler, max_workers=1)
+    captured_error: dict[str, BaseException] = {}
+
+    def call_submit_from_other_thread() -> None:
+        try:
+            runner.submit(lambda: 1)
+        except BaseException as exc:  # noqa: BLE001 - capture for the assertion below
+            captured_error["error"] = exc
+
+    try:
+        other = threading.Thread(target=call_submit_from_other_thread)
+        other.start()
+        other.join(timeout=2)
+
+        assert not other.is_alive()
+        assert isinstance(captured_error.get("error"), RuntimeError)
+    finally:
+        runner.shutdown()
+
+
+def test_shutdown_cancels_scheduled_tick_and_stray_tick_is_noop() -> None:
+    """`shutdown()` cancels the outstanding drain tick via `cancel_scheduled`,
+    and even a stray tick that still fires afterward is a safe no-op
+    (Fix B)."""
+    scheduler = _FakeScheduler()
+    runner = TaskRunner(
+        scheduler=scheduler, max_workers=2, cancel_scheduled=scheduler.cancel
+    )
+    done = threading.Event()
+    callback_fired = threading.Event()
+
+    def slow_work() -> int:
+        done.wait(timeout=2)
+        return 1
+
+    runner.submit(slow_work, on_success=lambda _r: callback_fired.set())
+
+    # A tick was scheduled by submit(); capture it before shutdown cancels it.
+    assert scheduler._pending
+
+    done.set()
+    runner.shutdown()
+
+    assert scheduler.cancelled_handles
+    # Nothing left pending in the fake scheduler after shutdown cancelled it.
+    assert not scheduler._pending
+
+    # Even if a stray tick still fires post-shutdown (e.g. no cancel_scheduled
+    # was wired up, or the cancel raced), _drain()'s own guard must make it a
+    # safe no-op rather than invoking callbacks against torn-down state.
+    runner._drain()
+
+    assert not callback_fired.is_set()
+
+
+def test_idle_then_resubmit_still_delivers() -> None:
+    """Regression test for the idle -> re-arm transition: after polling has
+    gone fully idle (no tick scheduled, `_pending == 0`), a fresh `submit()`
+    must still re-arm polling and deliver its result (Fix C)."""
+    scheduler = _FakeScheduler()
+    runner = TaskRunner(scheduler=scheduler, max_workers=2)
+    first_done = threading.Event()
+    second_done = threading.Event()
+    second_result: dict[str, int] = {}
+
+    try:
+        runner.submit(lambda: 1, on_success=lambda _r: first_done.set())
+        _pump_until(scheduler, first_done)
+
+        # Polling must be fully idle now: nothing pending, no tick armed.
+        assert runner._pending == 0
+        assert runner._tick_scheduled is False
+        assert not scheduler._pending
+
+        runner.submit(
+            lambda: 2,
+            on_success=lambda r: (second_result.__setitem__("value", r), second_done.set()),
+        )
+        _pump_until(scheduler, second_done)
+
+        assert second_result["value"] == 2
+    finally:
+        runner.shutdown()
+
+
+def test_callback_exception_does_not_stall_remaining_queue() -> None:
+    """If a consumer's `on_success`/`on_error` callback itself raises, the
+    drain loop must log it, keep going, and still re-arm polling for later
+    submissions (Fix D)."""
+    scheduler = _FakeScheduler()
+    runner = TaskRunner(scheduler=scheduler, max_workers=4)
+    second_done = threading.Event()
+    third_done = threading.Event()
+    second_fired = threading.Event()
+
+    def raising_on_success(_result: int) -> None:
+        second_fired.set()
+        raise ValueError("boom in on_success")
+
+    try:
+        runner.submit(lambda: 1, on_success=raising_on_success)
+        runner.submit(lambda: 2, on_success=lambda _r: second_done.set())
+        _pump_until(scheduler, second_done)
+
+        assert second_fired.is_set()
+        assert second_done.is_set()
+
+        # Runner must not be left in a stuck/un-rearmed state: a fresh
+        # submit still delivers.
+        runner.submit(lambda: 3, on_success=lambda _r: third_done.set())
+        _pump_until(scheduler, third_done)
+
+        assert third_done.is_set()
+    finally:
+        runner.shutdown()
