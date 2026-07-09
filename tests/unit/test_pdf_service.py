@@ -22,12 +22,53 @@ from app.core.exceptions import (
     PDFCorruptoError,
 )
 from app.core.services.pdf_service import PDFService
+from tests.fixtures.pdf_factory import make_corrupt_pdf, make_empty_file, make_valid_pdf
 
 
 def test_can_construct_service() -> None:
     service = PDFService()
 
     assert service._log.name == "app.core.services.pdf_service"
+
+
+def test_require_nonempty_file_accepts_valid_pdf(tmp_path: Path) -> None:
+    service = PDFService()
+    path = make_valid_pdf(tmp_path / "valid.pdf")
+
+    service._require_nonempty_file(path)
+
+
+def test_require_nonempty_file_rejects_empty_file(tmp_path: Path) -> None:
+    service = PDFService()
+    path = make_empty_file(tmp_path / "empty.pdf")
+
+    with pytest.raises(EntradaInvalidaError):
+        service._require_nonempty_file(path)
+
+
+def test_require_nonempty_file_rejects_missing_file(tmp_path: Path) -> None:
+    service = PDFService()
+
+    with pytest.raises(EntradaInvalidaError):
+        service._require_nonempty_file(tmp_path / "does-not-exist.pdf")
+
+
+def test_empty_file_and_corrupt_file_are_distinguishable_before_opening(
+    tmp_path: Path,
+) -> None:
+    """Regression test: `pikepdf` itself raises the identical `PdfError`
+    for a 0-byte file and for garbage bytes, so the empty/corrupt
+    distinction only exists if `_require_nonempty_file` runs first."""
+    service = PDFService()
+    empty_path = make_empty_file(tmp_path / "empty.pdf")
+    corrupt_path = make_corrupt_pdf(tmp_path / "corrupt.pdf")
+
+    with pytest.raises(EntradaInvalidaError):
+        service._require_nonempty_file(empty_path)
+
+    # A non-empty-but-corrupt file must NOT be rejected by this helper —
+    # that's `_translate_errors`' job (PDFCorruptoError), not this one's.
+    service._require_nonempty_file(corrupt_path)
 
 
 def test_validate_pages_accepts_in_range_pages() -> None:
