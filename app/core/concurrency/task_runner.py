@@ -48,13 +48,15 @@ _logger = get_logger(__name__)
 class TaskRunner:
     """Runs callables off the UI thread and delivers results back on it.
 
-    Thread affinity invariant: `submit()` and the queue-drain tick
-    (`_drain()`, invoked by `scheduler`) both mutate `_pending` and
-    `_tick_scheduled` without a lock. This is only race-free because both
-    are required to run on the same thread — the thread that constructed
-    this `TaskRunner` and that owns `scheduler` (the UI/main thread in
-    production). `submit()` enforces this at runtime by comparing
-    `threading.get_ident()` against the thread that called `__init__`.
+    Thread affinity invariant: `submit()`, `shutdown()`, and the
+    queue-drain tick (`_drain()`, invoked by `scheduler`) all mutate shared
+    state (`_pending`, `_tick_scheduled`, `_scheduled_handle`,
+    `_shutting_down`) without a lock. This is only race-free because all
+    three are required to run on the same thread — the thread that
+    constructed this `TaskRunner` and that owns `scheduler` (the UI/main
+    thread in production). `submit()` and `shutdown()` both enforce this at
+    runtime by comparing `threading.get_ident()` against the thread that
+    called `__init__`.
     """
 
     def __init__(
@@ -152,7 +154,24 @@ class TaskRunner:
         queue-drain ticks are scheduled after this call; even without a
         `cancel_scheduled`, `_drain()` itself no-ops once shutdown has
         started.
+
+        Must be called from the same thread that constructed this
+        `TaskRunner`, for the same reason as `submit()` — it mutates
+        `_shutting_down` and `_scheduled_handle`, the same unlocked shared
+        state `_drain()`/`_ensure_tick_scheduled()` touch.
+
+        Raises:
+            RuntimeError: if called from a thread other than the owner
+                thread.
         """
+        caller_thread_id = threading.get_ident()
+        if caller_thread_id != self._owner_thread_id:
+            raise RuntimeError(
+                "TaskRunner.shutdown() must be called from the thread that "
+                f"owns the scheduler (owner thread id={self._owner_thread_id}), "
+                f"but was called from thread id={caller_thread_id}."
+            )
+
         self._shutting_down = True
 
         if self._scheduled_handle is not None and self._cancel_scheduled is not None:
@@ -185,6 +204,7 @@ class TaskRunner:
             return
 
         self._tick_scheduled = False
+        self._scheduled_handle = None
 
         while True:
             try:

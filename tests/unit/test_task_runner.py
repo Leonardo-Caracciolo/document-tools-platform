@@ -226,6 +226,32 @@ def test_submit_from_non_owner_thread_raises() -> None:
         runner.shutdown()
 
 
+def test_shutdown_from_non_owner_thread_raises() -> None:
+    """`shutdown()` enforces the same thread-affinity invariant as `submit()`
+    since it also mutates `_shutting_down`/`_scheduled_handle` without a
+    lock (review follow-up on Fix A: the original fix only guarded
+    `submit()`)."""
+    scheduler = _FakeScheduler()
+    runner = TaskRunner(scheduler=scheduler, max_workers=1)
+    captured_error: dict[str, BaseException] = {}
+
+    def call_shutdown_from_other_thread() -> None:
+        try:
+            runner.shutdown()
+        except BaseException as exc:  # noqa: BLE001 - capture for the assertion below
+            captured_error["error"] = exc
+
+    try:
+        other = threading.Thread(target=call_shutdown_from_other_thread)
+        other.start()
+        other.join(timeout=2)
+
+        assert not other.is_alive()
+        assert isinstance(captured_error.get("error"), RuntimeError)
+    finally:
+        runner.shutdown()
+
+
 def test_shutdown_cancels_scheduled_tick_and_stray_tick_is_noop() -> None:
     """`shutdown()` cancels the outstanding drain tick via `cancel_scheduled`,
     and even a stray tick that still fires afterward is a safe no-op
