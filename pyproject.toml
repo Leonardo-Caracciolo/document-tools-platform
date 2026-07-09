@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "acrobat-tools"
+version = "0.1.0"
+description = "Acrobat Tools V2.0 - PDF utility suite scaffold (Sprint 0 foundation)."
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv",
+    "customtkinter",
+]
+
+[dependency-groups]
+lint = ["ruff"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# NOTE: [dependency-groups] follows PEP 735 and requires pip>=25.1 to install
+# directly (e.g. `pip install --group lint` / `pip install --group test`).
+# On pip<25.1, install the package in editable mode and add the tooling
+# manually instead:
+#   pip install -e .
+#   pip install ruff pytest
