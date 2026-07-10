@@ -264,11 +264,16 @@ class PDFService:
         """Encrypt `source` with AES-256 (`Encryption(R=6)`), writing to `output`.
 
         `user_password` defaults to `owner_password` when omitted, so the
-        output always requires a password to open. An already-encrypted
-        `source` cannot be opened without its own password, so
-        `pikepdf.Pdf.open` raises `pikepdf.PasswordError` for it here;
-        `_translate_errors` maps that to `ArchivoProtegidoError` for any
-        op other than `"unlock"` — the caller must `unlock` first.
+        output always requires a password to open. A `source` encrypted
+        with a non-empty user password cannot be opened without it, so
+        `pikepdf.Pdf.open` raises `pikepdf.PasswordError` for it here
+        (mapped to `ArchivoProtegidoError` by `_translate_errors`). But
+        owner-only encryption (a blank user password — valid,
+        spec-compliant "permissions-only" protection) opens with no
+        password at all, so that case needs its own explicit
+        `pdf.is_encrypted` check — the same guard `unlock` uses — or an
+        already-protected file would be silently re-encrypted instead of
+        rejected.
 
         Raises:
             `EntradaInvalidaError`: `source` is missing/0 bytes,
@@ -284,8 +289,12 @@ class PDFService:
         self._log.info("protect start: %s", source.name)
 
         with self._translate_errors("protect", source), pikepdf.Pdf.open(source) as pdf:
-            # Opening `source` above is the only validation this op needs
-            # (an already-encrypted source fails there) — safe to write now.
+            if pdf.is_encrypted:
+                raise ArchivoProtegidoError(
+                    f"{source.name!r} is already password-protected; unlock it first."
+                )
+
+            # Validated: safe to create the output dir and write.
             self._make_output_dir(output.parent)
             pdf.save(
                 output,

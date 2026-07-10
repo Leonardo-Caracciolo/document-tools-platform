@@ -404,6 +404,30 @@ class TestProtect:
         with pytest.raises(ArchivoProtegidoError):
             service.protect(source, tmp_path / "protected.pdf", owner_password="secret")
 
+    def test_protect_raises_archivo_protegido_for_owner_only_encrypted_input(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Regression: owner-only encryption (blank user password) opens
+        with NO password at all, so `pikepdf.Pdf.open` never raises — the
+        `pdf.is_encrypted` guard is the only thing catching this case."""
+        source = encrypted_pdf_factory("locked.pdf", owner="owner-secret", user="")
+        service = PDFService()
+
+        with pytest.raises(ArchivoProtegidoError):
+            service.protect(source, tmp_path / "protected.pdf", owner_password="secret")
+
+    def test_protect_rejects_already_encrypted_input_without_orphaning_output_dir(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = encrypted_pdf_factory("locked.pdf", owner="o", user="u")
+        service = PDFService()
+        output = tmp_path / "out" / "protected.pdf"
+
+        with pytest.raises(ArchivoProtegidoError):
+            service.protect(source, output, owner_password="secret")
+
+        assert not output.parent.exists()
+
     def test_protect_raises_entrada_invalida_for_empty_password(
         self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
     ) -> None:
@@ -486,3 +510,15 @@ class TestUnlock:
 
         with pytest.raises(EntradaInvalidaError):
             service.unlock(source, tmp_path / "unlocked.pdf", password="whatever")
+
+    def test_unlock_rejects_non_encrypted_input_without_orphaning_output_dir(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf")
+        service = PDFService()
+        output = tmp_path / "out" / "unlocked.pdf"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.unlock(source, output, password="whatever")
+
+        assert not output.parent.exists()
