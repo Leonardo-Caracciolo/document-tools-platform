@@ -376,6 +376,38 @@ class TestProviderErrorTranslation:
         assert fake.call_count == 2
         assert not output.exists()
 
+    def test_corrupt_pdf_raises_ocr_fallida_not_a_raw_pymupdf_exception(
+        self,
+        tmp_path: Path,
+        corrupt_pdf_factory: Callable[..., Path],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Regression: a structurally corrupt (but non-empty) `.pdf` must
+        be translated to `OCRFallidaError`, not let a raw
+        `pymupdf.FileDataError` escape with the absolute source path
+        embedded in its message. `_require_nonempty_pdf` only checks
+        extension and size, not parseability, so `pymupdf.open` is the
+        only thing that can actually detect this — `_translate_provider_
+        errors` must wrap that call, not just `provider.reconocer()`."""
+        fake = FakeOCRProvider("succeed")
+        service = OCRService(provider=fake)
+        source = corrupt_pdf_factory("corrupt.pdf")
+        output = tmp_path / "out.pdf"
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME), pytest.raises(
+            OCRFallidaError
+        ) as exc_info:
+            service.ocr(source, output)
+
+        assert type(exc_info.value) is OCRFallidaError
+        assert not output.exists()
+        assert fake.call_count == 0
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records
+        for record in warning_records:
+            assert str(tmp_path) not in record.getMessage()
+
 
 class TestAzureStub:
     def test_azure_provider_ocr_propagates_not_implemented(

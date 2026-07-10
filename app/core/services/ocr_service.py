@@ -90,20 +90,32 @@ class OCRService:
 
     @contextmanager
     def _translate_provider_errors(self, source: Path) -> Generator[None, None, None]:
-        """Map provider exceptions raised while recognizing text in `source`.
+        """Map recognition/pymupdf exceptions raised while processing `source`.
 
-        Scoped to wrap ONLY the `provider.reconocer()` call — validation
-        (`EntradaInvalidaError`) runs outside this context manager and
-        propagates unwrapped, same convention as
-        `ExportService._translate_provider_errors`.
+        Scoped to wrap the ENTIRE open-rasterize-recognize-overlay-save
+        pipeline in `ocr()` — NOT just `provider.reconocer()`. Unlike
+        `ExportService` (which never calls `pymupdf` itself, only its
+        provider), `OCRService` calls `pymupdf.open`/`page.get_pixmap`/
+        `page.insert_text`/`doc.save` directly, the same way `PDFService`
+        does — and `PDFService` has its own dedicated
+        `_translate_pymupdf_errors` boundary specifically because
+        `pymupdf.open` raises a raw `FileDataError`/`EmptyFileError` on a
+        structurally corrupt (but non-empty, so `_require_nonempty_pdf`
+        doesn't catch it) input. An earlier revision of this method wrapped
+        only `provider.reconocer()`, mirroring `ExportService` too
+        narrowly — review caught that a corrupt `.pdf` let a raw
+        `pymupdf.FileDataError` (with the full absolute source path in its
+        message) escape uncaught. Validation (`EntradaInvalidaError`)
+        still runs OUTSIDE this context manager and propagates unwrapped.
 
         Mapping:
             `OCRNoDisponibleError`, `OCRFallidaError`, `NotImplementedError`
                 -> re-raised unwrapped (the domain pair plus the Azure
                 stub's intentional v1 behavior)
-            any other exception (bare `RuntimeError` incl. "Tesseract
-                process timeout", `TimeoutError`, any other raw
-                `pytesseract`/Tesseract failure) -> `OCRFallidaError`
+            any other exception (raw `pymupdf.FileDataError`/`EmptyFileError`
+                on open/save, bare `RuntimeError` incl. "Tesseract process
+                timeout", `TimeoutError`, any other raw `pytesseract`/
+                Tesseract failure) -> `OCRFallidaError`, filename-only
         """
         try:
             yield
@@ -168,7 +180,10 @@ class OCRService:
             OCRNoDisponibleError: the active provider reports it cannot
                 perform recognition right now.
             OCRFallidaError: the provider's recognition failed or
-                exceeded its timeout on any page.
+                exceeded its timeout on any page, OR `source` is
+                structurally corrupt/unrasterizable (non-empty but not a
+                valid PDF — `_require_nonempty_pdf` only checks extension
+                and size, not parseability) or `output` failed to save.
             NotImplementedError: the Azure stub provider is active — the
                 intentional v1 deliverable for that provider, not
                 translated to a domain exception.
@@ -178,27 +193,27 @@ class OCRService:
         self._require_nonempty_pdf(source)
         self._make_output_dir(output.parent)
 
-        doc = pymupdf.open(source)
-        try:
-            for page in doc:
-                pix = page.get_pixmap(dpi=_RASTER_DPI)
-                image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        with self._translate_provider_errors(source):
+            doc = pymupdf.open(source)
+            try:
+                for page in doc:
+                    pix = page.get_pixmap(dpi=_RASTER_DPI)
+                    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-                with self._translate_provider_errors(source):
                     words = self._provider.reconocer(image)
 
-                for word in words:
-                    point = (
-                        word.left * _POINTS_PER_INCH / _RASTER_DPI,
-                        (word.top + word.height) * _POINTS_PER_INCH / _RASTER_DPI,
-                    )
-                    fontsize = word.height * _POINTS_PER_INCH / _RASTER_DPI
-                    page.insert_text(point, word.text, fontsize=fontsize, render_mode=3)
+                    for word in words:
+                        point = (
+                            word.left * _POINTS_PER_INCH / _RASTER_DPI,
+                            (word.top + word.height) * _POINTS_PER_INCH / _RASTER_DPI,
+                        )
+                        fontsize = word.height * _POINTS_PER_INCH / _RASTER_DPI
+                        page.insert_text(point, word.text, fontsize=fontsize, render_mode=3)
 
-            # All pages recognized and overlaid: safe to write now.
-            doc.save(output)
-        finally:
-            doc.close()
+                # All pages recognized and overlaid: safe to write now.
+                doc.save(output)
+            finally:
+                doc.close()
 
         self._log.info("ocr ok: %s -> %s", source.name, output.name)
         return output
