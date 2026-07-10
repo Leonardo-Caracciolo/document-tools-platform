@@ -10,11 +10,13 @@ real Word COM automation.
 
 This dev machine has pywin32, docx2pdf, and a registered `Word.Application`
 ProgID (confirmed empirically during design — see
-`sdd/word-to-pdf-provider/design`), so the "available" branch is exercised
-for real, with no mocking. The "unavailable" branches are exercised by
-monkeypatching `platform.system`/`importlib.util.find_spec`/
-`winreg.OpenKey` individually, since this machine can't otherwise produce
-those conditions.
+`sdd/word-to-pdf-provider/design`), so the "available" branch CAN be
+exercised for real, with no mocking — but GitHub-hosted `windows-latest`
+CI runners do NOT have Office installed, so that test self-skips rather
+than hardcoding an assumption only true on this machine. The "unavailable"
+branches are exercised by monkeypatching `platform.system`/
+`importlib.util.find_spec`/`winreg.OpenKey` individually, since this
+machine can't otherwise produce those conditions.
 """
 
 from __future__ import annotations
@@ -37,10 +39,23 @@ def test_com_word_provider_satisfies_the_protocol() -> None:
 @pytest.mark.skipif(
     platform.system() != "Windows", reason="Word COM checks only apply on Windows"
 )
-def test_esta_disponible_reports_available_on_this_dev_machine() -> None:
+def test_esta_disponible_reports_available_when_office_is_installed() -> None:
+    """Real, unmocked probe against whatever this runner actually has.
+
+    Self-skips rather than hardcoding availability: this dev machine has
+    Office installed, but GitHub-hosted `windows-latest` CI runners do
+    not — asserting `True` unconditionally would pass here and fail
+    there. The negative-path tests below already cover the detection
+    LOGIC via monkeypatching; this test only confirms the happy path is
+    reachable on a machine where Office genuinely is present.
+    """
     provider = ComWordProvider()
 
-    assert provider.esta_disponible() == (True, "COM/Word available")
+    available, reason = provider.esta_disponible()
+    if not available:
+        pytest.skip(f"Office/Word not available on this runner: {reason}")
+
+    assert (available, reason) == (True, "COM/Word available")
 
 
 def test_esta_disponible_reports_unavailable_on_non_windows(
