@@ -121,6 +121,34 @@ class TestValidation:
         assert "not_a_docx.txt" in warning_records[0].getMessage()
         assert str(tmp_path) not in warning_records[0].getMessage()
 
+    @pytest.mark.parametrize("suffix", [".doc", ".docm"])
+    def test_rejects_other_word_formats_out_of_v1_scope(
+        self, tmp_path: Path, suffix: str
+    ) -> None:
+        fake = FakeDocumentConverterProvider("succeed")
+        service = ExportService(provider=fake)
+        source = tmp_path / f"legacy{suffix}"
+        source.write_text("not actually a docx, extension is what's tested")
+
+        with pytest.raises(EntradaInvalidaError):
+            service.convertir(source, tmp_path / "out.pdf")
+
+        assert fake.called is False
+
+    def test_accepts_uppercase_docx_extension(
+        self, tmp_path: Path, valid_docx_factory: Callable[..., Path]
+    ) -> None:
+        fake = FakeDocumentConverterProvider("succeed")
+        service = ExportService(provider=fake)
+        source = valid_docx_factory("doc.docx")
+        uppercased = source.with_suffix(".DOCX")
+        source.rename(uppercased)
+
+        result = service.convertir(uppercased, tmp_path / "out.pdf")
+
+        assert fake.called is True
+        assert result == tmp_path / "out.pdf"
+
     def test_rejects_missing_source(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -261,6 +289,28 @@ class TestProviderErrorTranslation:
             service.convertir(source, tmp_path / "out.pdf")
 
         assert type(exc_info.value) is ConversionFallidaError
+
+    @pytest.mark.parametrize("behavior", ["fail", "timeout"])
+    def test_provider_failure_leaves_no_partial_output_file(
+        self, tmp_path: Path, valid_docx_factory: Callable[..., Path], behavior: str
+    ) -> None:
+        """No partial/corrupt PDF survives a provider failure.
+
+        `_make_output_dir` runs before the provider call (design's
+        documented, PDFService-consistent tradeoff — see
+        `ExportService._make_output_dir`'s docstring), so the output
+        *directory* may exist afterward; what must NOT happen is a
+        partial or stale file at `output` itself.
+        """
+        fake = FakeDocumentConverterProvider(behavior)
+        service = ExportService(provider=fake)
+        source = valid_docx_factory("doc.docx")
+        output = tmp_path / "out.pdf"
+
+        with pytest.raises(ConversionFallidaError):
+            service.convertir(source, output)
+
+        assert not output.exists()
 
 
 class TestAzureStub:
