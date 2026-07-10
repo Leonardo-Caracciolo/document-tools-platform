@@ -741,6 +741,24 @@ class TestCompress:
 
         assert not output.exists()
 
+    def test_compress_raises_archivo_protegido_for_owner_only_encrypted_input(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Regression: `pymupdf.Document.needs_pass`/`is_encrypted` both
+        read False for owner-only encryption (blank user password) —
+        empirically confirmed different from `pikepdf`, which correctly
+        reports it as encrypted. `compress` must rely on the `pikepdf`
+        check, not `pymupdf`'s signals, or it silently strips
+        permissions-only protection during recompression."""
+        source = encrypted_pdf_factory("owner_only.pdf", owner="owner-secret", user="")
+        service = PDFService()
+        output = tmp_path / "compressed.pdf"
+
+        with pytest.raises(ArchivoProtegidoError):
+            service.compress(source, output)
+
+        assert not output.exists()
+
     def test_compress_raises_pdf_corrupto_naming_offending_file(
         self, tmp_path: Path, corrupt_pdf_factory: Callable[..., Path]
     ) -> None:
@@ -792,13 +810,13 @@ class TestCompress:
 
 
 class TestCrossCuttingLoggingAndExceptionContainment:
-    """Cross-cutting tests (4.3/4.4) exercised across all six operations.
+    """Cross-cutting tests (4.3/4.4) exercised across all seven operations.
 
     Verifies every operation logs INFO on success and WARNING on
     failure via the Sprint 0 `get_logger` (filename-only messages, no
     absolute paths, no passwords), and that no raw
-    `pikepdf`/`img2pdf`/`Pillow` exception ever surfaces to a caller —
-    only the four domain exceptions do.
+    `pikepdf`/`img2pdf`/`Pillow`/`pymupdf` exception ever surfaces to a
+    caller — only the four domain exceptions do.
     """
 
     _RAW_LIBRARY_EXCEPTIONS = (
@@ -808,6 +826,8 @@ class TestCrossCuttingLoggingAndExceptionContainment:
         OSError,
         img2pdf.ImageOpenError,
         img2pdf.AlphaChannelError,
+        pymupdf.FileDataError,
+        pymupdf.EmptyFileError,
     )
 
     def test_all_six_ops_log_info_on_success(
@@ -834,6 +854,7 @@ class TestCrossCuttingLoggingAndExceptionContainment:
                 encrypted, tmp_path / "unlock_ok.pdf", password="user-pwd"
             ),
             "jpg_to_pdf": lambda: service.jpg_to_pdf([image], tmp_path / "jpg_ok.pdf"),
+            "compress": lambda: service.compress(good, tmp_path / "compress_ok.pdf"),
         }
 
         with caplog.at_level(logging.INFO, logger="app.core.services.pdf_service"):
@@ -894,6 +915,10 @@ class TestCrossCuttingLoggingAndExceptionContainment:
             "jpg_to_pdf": (
                 lambda: service.jpg_to_pdf([corrupt_image], tmp_path / "jpg_bad.pdf"),
                 EntradaInvalidaError,
+            ),
+            "compress": (
+                lambda: service.compress(corrupt, tmp_path / "compress_bad.pdf"),
+                PDFCorruptoError,
             ),
         }
 

@@ -5,7 +5,7 @@
 (jpg_to_pdf), and `pymupdf` (compress). Every method returns the
 written output path(s). Library exceptions are translated to domain
 exceptions (`app.core.exceptions`) at scoped boundaries
-(`_translate_errors` for pikepdf/img2pdf/Pillow, `_translate_fitz_errors`
+(`_translate_errors` for pikepdf/img2pdf/Pillow, `_translate_pymupdf_errors`
 for pymupdf) so no raw library exception ever reaches a caller.
 
 Stateless and thread-safe: no config injection, no internal
@@ -36,7 +36,7 @@ from app.core.exceptions import (
 )
 from app.infrastructure.logger import get_logger
 
-#: The seven operations `_translate_errors`/`_translate_fitz_errors` can be
+#: The seven operations `_translate_errors`/`_translate_pymupdf_errors` can be
 #: called for. A closed `Literal` instead of a bare `str` so a typo'd op
 #: name (e.g. "unlok") fails type-checking instead of silently falling
 #: into the wrong exception branch below.
@@ -52,7 +52,7 @@ _COMPRESS_JPEG_QUALITY = 75
 
 
 class PDFService:
-    """Stateless PDF/image operations over `pikepdf`, `img2pdf`, and `Pillow`.
+    """Stateless PDF/image operations over `pikepdf`, `img2pdf`, `Pillow`, and `pymupdf`.
 
     Holds only a logger — every method takes its input/output paths
     per-call, per SSD §8 (no hardcoded/default paths).
@@ -99,7 +99,7 @@ class PDFService:
             raise EntradaInvalidaError(f"{source.name!r} cannot be converted to PDF.") from exc
 
     @contextmanager
-    def _translate_fitz_errors(self, op: Operation, source: Path) -> Generator[None, None, None]:
+    def _translate_pymupdf_errors(self, op: Operation, source: Path) -> Generator[None, None, None]:
         """Map `pymupdf` exceptions raised while performing `op` on `source`.
 
         Separate from `_translate_errors` by design: that context manager
@@ -112,12 +112,19 @@ class PDFService:
         untouched.
 
         Mapping:
-            `pymupdf.FileDataError`, `pymupdf.EmptyFileError` (and their
-            `RuntimeError` base) -> `PDFCorruptoError`
+            `pymupdf.FileDataError`, `pymupdf.EmptyFileError` -> `PDFCorruptoError`
+
+        Deliberately NOT a bare `RuntimeError` catch (both exception types
+        above are already `RuntimeError` subclasses, so that would be both
+        redundant and too broad): this context manager wraps the entire
+        `rewrite_images`/`subset_fonts`/`tobytes` pipeline, not just
+        `pymupdf.open`, so a blanket `RuntimeError` catch would relabel
+        any unrelated failure during recompression as "corrupt PDF" —
+        inaccurate and misleading for debugging.
         """
         try:
             yield
-        except (pymupdf.FileDataError, pymupdf.EmptyFileError, RuntimeError) as exc:
+        except (pymupdf.FileDataError, pymupdf.EmptyFileError) as exc:
             self._log.warning("%s failed: corrupt PDF (%s)", op, source.name)
             raise PDFCorruptoError(f"{source.name!r} is corrupt or unreadable.") from exc
 
@@ -467,8 +474,20 @@ class PDFService:
         or text-only input), `output` receives a literal byte-for-byte
         copy of `source`, never a re-save, so it stays bytes-identical
         to the original. The start log deliberately runs BEFORE
-        `_require_nonempty_file` (spec-mandated ordering, unlike the six
-        other operations which validate first).
+        `_require_nonempty_file` (spec-mandated ordering; `jpg_to_pdf`
+        has similar list-level-vs-start-log behavior, though this is the
+        first operation where it's this explicit).
+
+        Encryption is checked via `pikepdf`, NOT `pymupdf`: empirically,
+        `pymupdf.Document.needs_pass`/`is_encrypted` both read `False`
+        for an owner-only-encrypted PDF (a blank user password — the
+        same "permissions-only" mode that required an explicit
+        `pdf.is_encrypted` guard in `protect`), while `pikepdf` correctly
+        reports it as encrypted. Trusting `pymupdf`'s signals here would
+        silently strip a user's permissions protection during
+        recompression, so the already-open-and-reliable `pikepdf` check
+        (reusing the existing `_translate_errors` boundary) gates entry
+        before `pymupdf` ever touches the file.
 
         Raises:
             `EntradaInvalidaError`: `source` is missing/0 bytes, or
@@ -479,18 +498,25 @@ class PDFService:
         self._log.info("compress start: %s", source.name)
         self._require_nonempty_file(source, "compress")
 
-        with self._translate_fitz_errors("compress", source):
+        with self._translate_errors("compress", source), pikepdf.Pdf.open(source) as check:
+            if check.is_encrypted:
+                self._log.warning(
+                    "compress failed: password-protected input (%s)", source.name
+                )
+                raise ArchivoProtegidoError(
+                    f"{source.name!r} is password-protected; unlock it first."
+                )
+
+        with self._translate_pymupdf_errors("compress", source):
             doc = pymupdf.open(source)
             try:
-                if doc.needs_pass or doc.is_encrypted:
-                    self._log.warning(
-                        "compress failed: password-protected input (%s)", source.name
-                    )
-                    raise ArchivoProtegidoError(
-                        f"{source.name!r} is password-protected; unlock it first."
-                    )
                 doc.rewrite_images(dpi_target=_COMPRESS_DPI, quality=_COMPRESS_JPEG_QUALITY)
                 doc.subset_fonts()
+                # Structural cleanup, not tunable per-file like the image/font
+                # pass above: garbage=4 (max unused-object collection) + full
+                # deflate + use_objstms=1 (compress the xref/object streams
+                # themselves) — same "squeeze everything" profile regardless
+                # of input, so no dedicated constants for these.
                 candidate = doc.tobytes(
                     garbage=4,
                     deflate=True,
