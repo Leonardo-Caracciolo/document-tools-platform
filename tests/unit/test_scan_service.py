@@ -72,16 +72,30 @@ class FakeDeskewFn:
     parent directory it wrote into (`tmp_dirs_seen`) — the latter lets
     tests assert on `ScanService`'s internal `TemporaryDirectory` even
     though it's never exposed directly.
+
+    Optionally appends `"deskew:<filename>"` into a SHARED `call_log`
+    list (the same list `FakePdfService`/`FakeOcrService` append into) —
+    without this, a composition-order test comparing `deskew.calls` and
+    `call_log` as two SEPARATE lists can only prove each list's own
+    internal order, not that every deskew call actually preceded
+    `jpg_to_pdf`/`ocr` in one real timeline (a bug that moved `jpg_to_pdf`
+    inside the deskew loop, called once per image, could still pass a
+    two-separate-lists assertion).
     """
 
-    def __init__(self, behaviors: dict[str, str] | None = None) -> None:
+    def __init__(
+        self, behaviors: dict[str, str] | None = None, call_log: list[str] | None = None
+    ) -> None:
         self.behaviors = behaviors or {}
         self.calls: list[Path] = []
         self.tmp_dirs_seen: list[Path] = []
+        self._call_log = call_log
 
     def __call__(self, src: Path, dst: Path) -> bool:
         self.calls.append(src)
         self.tmp_dirs_seen.append(dst.parent)
+        if self._call_log is not None:
+            self._call_log.append(f"deskew:{src.name}")
         behavior = self.behaviors.get(src.name, "succeed")
         if behavior == "raise":
             raise RuntimeError("fake raw cv2 failure")
@@ -223,8 +237,8 @@ class TestHappyPathAndComposition:
     ) -> None:
         page1 = jpg_factory("page1.jpg")
         page2 = jpg_factory("page2.jpg")
-        deskew = FakeDeskewFn()
         call_log: list[str] = []
+        deskew = FakeDeskewFn(call_log=call_log)
         pdf_service = FakePdfService(call_log)
         ocr_service = FakeOcrService(call_log)
         service = ScanService(deskew, pdf_service, ocr_service)
@@ -232,7 +246,10 @@ class TestHappyPathAndComposition:
         service.scan_to_pdf([page1, page2], tmp_path / "out.pdf")
 
         assert deskew.calls == [page1, page2]
-        assert call_log == ["jpg_to_pdf", "ocr"]
+        # One shared timeline (not two separately-ordered lists): proves
+        # every deskew call genuinely precedes jpg_to_pdf/ocr, not just
+        # that each fake's own calls happen to be internally ordered.
+        assert call_log == ["deskew:page1.jpg", "deskew:page2.jpg", "jpg_to_pdf", "ocr"]
         assert pdf_service.called_with is not None
         assert len(pdf_service.called_with[0]) == 2
         assert ocr_service.called_with is not None
@@ -326,6 +343,32 @@ class TestExceptionContainment:
 
         assert type(exc_info.value) is OCRFallidaError
         assert call_log == ["jpg_to_pdf", "ocr"]
+
+    def test_temp_directory_os_error_is_translated_not_raw(
+        self,
+        tmp_path: Path,
+        jpg_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression: `tempfile.TemporaryDirectory()` is raw OS I/O with
+        no translation of its own — `_translate_deskew_errors` only
+        covers `deskew_fn`. A restricted `%TEMP%`/disk-full/AV-locked
+        cleanup must still surface as `EntradaInvalidaError`, never a
+        raw `OSError`."""
+        page1 = jpg_factory("page1.jpg")
+        service = ScanService(FakeDeskewFn(), FakePdfService([]), FakeOcrService([]))
+
+        def _raise_os_error(*_args: object, **_kwargs: object) -> None:
+            raise OSError("simulated restricted %TEMP%")
+
+        monkeypatch.setattr(
+            "app.core.services.scan_service.tempfile.TemporaryDirectory", _raise_os_error
+        )
+
+        with pytest.raises(EntradaInvalidaError) as exc_info:
+            service.scan_to_pdf([page1], tmp_path / "out.pdf")
+
+        assert type(exc_info.value) is EntradaInvalidaError
 
 
 class TestTempCleanup:

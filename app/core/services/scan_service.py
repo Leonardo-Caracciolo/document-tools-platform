@@ -18,7 +18,11 @@ since both already fully translate their own libraries and re-wrapping
 risks mangling an already-correct domain exception type into the wrong
 one), validate-then-write (every image is validated all-or-nothing
 before any temp artifact or `cv2` work, design's Decision 3), and
-filename-only logging.
+filename-only logging. `scan_to_pdf` also wraps its own
+`tempfile.TemporaryDirectory()` usage in a narrow `except OSError` —
+that call is raw OS I/O with no translation of its own (unlike `cv2`,
+which `_translate_deskew_errors` covers), so a restricted `%TEMP%` or a
+mid-cleanup file lock would otherwise let a raw `OSError` escape.
 """
 
 from __future__ import annotations
@@ -67,8 +71,11 @@ class ScanService:
         own libraries at their own boundaries, so wrapping them here
         would risk re-labeling an already-correct domain exception (e.g.
         turning an `OCRFallidaError` into `EntradaInvalidaError`). `cv2`
-        is the only raw library `ScanService` calls directly, so it gets
-        exactly one scoped boundary, same convention as `PDFService`'s
+        (via `deskew_fn`) is the only raw library call this context
+        manager needs to cover — `scan_to_pdf`'s own `tempfile` usage has
+        a SEPARATE, narrower `except OSError` around it, since that's a
+        different raw-I/O surface this CM was never meant to reach.
+        Mirrors the same overall convention as `PDFService`'s
         `_translate_errors`/`_translate_pymupdf_errors` and `OCRService`'s
         `_translate_provider_errors`.
 
@@ -136,24 +143,40 @@ class ScanService:
 
         self._validate_images(images)
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            cleaned_paths: list[Path] = []
-            for index, image in enumerate(images):
-                cleaned_path = tmp_path / f"clean_{index}{image.suffix}"
-                with self._translate_deskew_errors(image):
-                    confident = self._deskew_fn(image, cleaned_path)
-                if not confident:
-                    self._log.warning(
-                        "scan_to_pdf: no confident document boundary, using degraded"
-                        " image (%s)",
-                        image.name,
-                    )
-                cleaned_paths.append(cleaned_path)
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                cleaned_paths: list[Path] = []
+                for index, image in enumerate(images):
+                    cleaned_path = tmp_path / f"clean_{index}{image.suffix}"
+                    with self._translate_deskew_errors(image):
+                        confident = self._deskew_fn(image, cleaned_path)
+                    if not confident:
+                        self._log.warning(
+                            "scan_to_pdf: no confident document boundary, using degraded"
+                            " image (%s)",
+                            image.name,
+                        )
+                    cleaned_paths.append(cleaned_path)
 
-            intermediate_path = tmp_path / "intermediate.pdf"
-            self._pdf_service.jpg_to_pdf(cleaned_paths, intermediate_path)
-            self._ocr_service.ocr(intermediate_path, output)
+                intermediate_path = tmp_path / "intermediate.pdf"
+                self._pdf_service.jpg_to_pdf(cleaned_paths, intermediate_path)
+                self._ocr_service.ocr(intermediate_path, output)
+        except OSError as exc:
+            # tempfile.TemporaryDirectory() itself calls raw OS I/O
+            # (mkdtemp on entry, rmtree on exit) with no error translation
+            # of its own — the only raw-library call in this method that
+            # _translate_deskew_errors doesn't cover (that CM is scoped to
+            # `self._deskew_fn` only, per Decision 2). A restricted %TEMP%,
+            # disk-full, or an AV-locked file mid-cleanup would otherwise
+            # let a raw OSError escape uncaught, violating SSD §8's "never
+            # a raw traceback" invariant. EntradaInvalidaError is the
+            # right target: same semantic class as PDFService's/
+            # OCRService's own _make_output_dir OSError -> EntradaInvalidaError.
+            self._log.warning("scan_to_pdf failed: temp directory error (%s)", exc)
+            raise EntradaInvalidaError(
+                "Could not create or clean up a temporary working directory."
+            ) from exc
 
         self._log.info("scan_to_pdf ok: %d image(s) -> %s", len(images), output.name)
         return output
