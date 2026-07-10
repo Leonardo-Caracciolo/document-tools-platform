@@ -1,7 +1,8 @@
-"""Shared pytest fixtures for synthetic PDF/JPG test artifacts.
+"""Shared pytest fixtures for synthetic PDF/JPG/`.docx` test artifacts.
 
-Wraps `tests.fixtures.pdf_factory` builders as `tmp_path`-scoped fixtures
-so `PDFService` tests never depend on committed binary files.
+Wraps `tests.fixtures.pdf_factory` and `tests.fixtures.docx_factory`
+builders as `tmp_path`-scoped fixtures so `PDFService`/`ExportService`
+tests never depend on committed binary files.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures.docx_factory import make_valid_docx
 from tests.fixtures.pdf_factory import (
     make_corrupt_jpg,
     make_corrupt_pdf,
@@ -90,5 +92,15 @@ def image_heavy_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
 
     def _make(name: str = "image_heavy.pdf") -> Path:
         return make_image_heavy_pdf(tmp_path / name)
+
+    return _make
+
+
+@pytest.fixture
+def valid_docx_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes a valid `.docx` under `tmp_path`."""
+
+    def _make(name: str = "valid.docx") -> Path:
+        return make_valid_docx(tmp_path / name)
 
     return _make
