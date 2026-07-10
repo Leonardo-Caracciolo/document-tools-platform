@@ -17,6 +17,7 @@ dependencies = [
     "pywin32",
     "pytesseract",
     "opencv-python-headless>=5.0.0,<6",
+    "pdf2docx>=0.5.13",
 ]
 
 [dependency-groups]

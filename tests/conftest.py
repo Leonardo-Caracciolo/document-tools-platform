@@ -21,6 +21,7 @@ from tests.fixtures.pdf_factory import (
     make_encrypted_pdf,
     make_image_heavy_pdf,
     make_jpg,
+    make_native_text_pdf,
     make_valid_pdf,
 )
 
@@ -113,5 +114,17 @@ def image_only_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
 
     def _make(name: str = "image_only.pdf", text: str = "Factura Total") -> Path:
         return make_image_only_pdf(tmp_path / name, text)
+
+    return _make
+
+
+@pytest.fixture
+def native_text_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes a PDF with real, extractable text under `tmp_path`."""
+
+    def _make(
+        name: str = "native_text.pdf", text: str = "Documento con texto nativo de prueba."
+    ) -> Path:
+        return make_native_text_pdf(tmp_path / name, text)
 
     return _make

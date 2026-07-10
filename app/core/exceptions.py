@@ -11,7 +11,9 @@ tracebacks.
 
 `ConversorNoDisponibleError` and `ConversionFallidaError` are raised by
 `app.core.services.export_service` so COM/`pywin32` failures never reach
-callers as raw tracebacks.
+callers as raw tracebacks. `PDFSinTextoError` is also raised by
+`app.core.services.export_service`, alongside `PDFCorruptoError` and
+`ConversionFallidaError`, for its `.pdf` -> `.docx` direction.
 
 `OCRNoDisponibleError` and `OCRFallidaError` are raised by
 `app.core.services.ocr_service` so `pytesseract`/Tesseract subprocess
@@ -47,6 +49,10 @@ class ConversorNoDisponibleError(Exception):
 
 class ConversionFallidaError(Exception):
     """Raised when a document conversion fails or exceeds its timeout."""
+
+
+class PDFSinTextoError(Exception):
+    """Raised when a PDF has no extractable text layer (likely scanned or image-only)."""
 
 
 class OCRNoDisponibleError(Exception):

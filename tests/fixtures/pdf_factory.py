@@ -13,6 +13,7 @@ from pathlib import Path
 
 import img2pdf
 import pikepdf
+import pymupdf
 from PIL import Image
 
 
@@ -22,6 +23,27 @@ def make_valid_pdf(path: Path, pages: int = 3) -> Path:
     for _ in range(pages):
         pdf.add_blank_page(page_size=(612, 792))
     pdf.save(path)
+    return path
+
+
+def make_native_text_pdf(path: Path, text: str) -> Path:
+    """Write a single-page PDF with `text` inserted as real, selectable text to `path`.
+
+    Confirmed during `sdd/pdf-to-word/design`'s empirical pass:
+    `pymupdf`'s `page.insert_text` produces genuine extractable text
+    (`page.get_text()` returns it, non-empty) and converts correctly
+    end-to-end via `pdf2docx`. `make_valid_pdf` CANNOT be reused for this
+    purpose — its pages are blank, so `get_text()` returns `''` and the
+    scanned-PDF detection in `ExportService.pdf_a_word` would wrongly
+    reject it.
+    """
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page()
+        page.insert_text((72, 72), text)
+        doc.save(path)
+    finally:
+        doc.close()
     return path
 
 

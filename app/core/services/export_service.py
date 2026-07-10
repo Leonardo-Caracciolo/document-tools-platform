@@ -1,4 +1,4 @@
-"""`ExportService` — `.docx` -> PDF conversion orchestrator, per SSD §5.1/§6.2.
+"""`ExportService` — `.docx` <-> PDF conversion orchestrator, per SSD §5.1/§6.2/§4.1.
 
 `ExportService` is NOT a `PDFService` extension (see
 `sdd/word-to-pdf-provider/design`, "Technical Approach"): it owns its own
@@ -15,6 +15,13 @@ override (design Decision 2): when `provider` is omitted, a
 the concrete provider class from `_PROVIDERS`; an explicit `provider`
 argument overrides the factory entirely, which is what makes fake-provider
 unit testing possible without real Office/COM.
+
+`pdf_a_word` (`sdd/pdf-to-word/design`) is the reverse direction, added
+later and additive: it calls `pdf2docx` directly (no provider
+abstraction exists for it, no cloud/local split), the same way
+`PDFService` calls `pikepdf`/`pymupdf` directly. It does NOT participate
+in `_PROVIDERS`/the `convertir` provider factory, and `convertir`'s own
+behavior is untouched by it.
 """
 
 from __future__ import annotations
@@ -24,15 +31,32 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
+import pymupdf
+from pdf2docx import Converter
+
 from app.core.exceptions import (
     ConversionFallidaError,
     ConversorNoDisponibleError,
     EntradaInvalidaError,
+    PDFCorruptoError,
+    PDFSinTextoError,
 )
 from app.core.providers.azure_doc_converter_provider import AzureDocConverterProvider
 from app.core.providers.com_word_provider import ComWordProvider
 from app.core.providers.document_converter_provider import DocumentConverterProvider
 from app.infrastructure.logger import get_logger
+
+#: Minimum non-whitespace character count across all pages of a `.pdf`
+#: `pdf_a_word` will accept as "has native text". Confirmed during
+#: `sdd/pdf-to-word/design`'s empirical pass: `pdf2docx` does NOT raise on
+#: a scanned/image-only PDF — it silently produces a garbage, near-empty
+#: `.docx` and reports success. This threshold is the ONLY gate that
+#: correctly rejects that input before `pdf2docx` ever touches it.
+#: Synthetic fixtures give a clean 0-vs-hundreds separation, so any value
+#: in [1, hundreds) would pass tests; 16 is a v1 starting value to also
+#: guard real-world near-empty stray-artifact text layers, same tunable
+#: status as `PDFService.compress`'s recompression constants.
+_MIN_TEXT_CHARS = 16
 
 #: `DOC_CONVERTER_PROVIDER` value -> concrete provider class. Mirrors the
 #: same env var `app.infrastructure.config.DocConverterConfig` reads, but
@@ -151,6 +175,118 @@ class ExportService:
 
         with self._translate_provider_errors(source):
             self._provider.convertir(source, output)
+
+        self._log.info("export ok: %s -> %s", source.name, output.name)
+        return output
+
+    def _require_nonempty_pdf(self, source: Path) -> None:
+        """Raise `EntradaInvalidaError` if `source` is not a non-empty `.pdf` file.
+
+        Own copy — NOT imported from `PDFService`/`OCRService` (same
+        precedent as `_require_nonempty_docx` above and
+        `OCRService._require_nonempty_pdf`). Extension is checked first
+        so a wrong-extension file never reaches the filesystem stat call.
+        """
+        if source.suffix.lower() != ".pdf":
+            self._log.warning("export failed: not a .pdf file (%s)", source.name)
+            raise EntradaInvalidaError(f"{source.name!r} is not a PDF file.")
+        if not source.is_file() or source.stat().st_size == 0:
+            self._log.warning("export failed: missing or empty input (%s)", source.name)
+            raise EntradaInvalidaError(f"{source.name!r} is empty or does not exist.")
+
+    @contextmanager
+    def _translate_pdf_open_errors(self, source: Path) -> Generator[None, None, None]:
+        """Map raw `pymupdf` exceptions raised while opening/parsing `source`.
+
+        Scoped to wrap BOTH the `pymupdf.open`/`get_text()` calls used for
+        scanned-PDF detection AND the `pdf2docx.Converter(...)`
+        CONSTRUCTOR call — confirmed during design's empirical pass that
+        `Converter(corrupt_path)` itself raises the identical raw
+        `pymupdf.FileDataError` a corrupt PDF raises on `pymupdf.open`,
+        not just `.convert()`. A boundary that only wrapped `.convert()`
+        would let that constructor-time exception escape uncaught.
+
+        Mapping:
+            `pymupdf.FileDataError`, `pymupdf.EmptyFileError` -> `PDFCorruptoError`
+        """
+        try:
+            yield
+        except (pymupdf.FileDataError, pymupdf.EmptyFileError) as exc:
+            self._log.warning("export failed: corrupt PDF (%s)", source.name)
+            raise PDFCorruptoError(f"{source.name!r} is corrupt or unreadable.") from exc
+
+    @contextmanager
+    def _translate_conversion_errors(
+        self, source: Path, output: Path
+    ) -> Generator[None, None, None]:
+        """Map raw `pdf2docx` exceptions raised while converting `source` to `output`.
+
+        Scoped to wrap ONLY the `Converter.convert()` call — `pdf2docx`'s
+        `.convert()` IS the write step (validate-then-write), so a
+        mid-conversion failure could leave a partial `output` file;
+        `output.unlink(missing_ok=True)` cleans it up before re-raising.
+
+        Mapping:
+            any exception -> `ConversionFallidaError`, filename-only warning
+        """
+        try:
+            yield
+        except Exception as exc:
+            self._log.warning("export failed: conversion error (%s)", source.name)
+            output.unlink(missing_ok=True)
+            raise ConversionFallidaError(f"Conversion of {source.name!r} failed.") from exc
+
+    def pdf_a_word(self, source: Path, output: Path) -> Path:
+        """Convert `source` (`.pdf`) to a `.docx` at `output` via `pdf2docx`.
+
+        Detects, BEFORE attempting conversion, whether `source` has any
+        extractable text (accumulated non-whitespace `get_text()` chars
+        across all pages, threshold `_MIN_TEXT_CHARS`). Confirmed during
+        design's empirical pass that `pdf2docx` does NOT raise on a
+        scanned/image-only PDF — it silently produces a garbage,
+        near-empty `.docx` and reports success — so this upfront gate is
+        the only correct way to reject that input; detection never
+        depends on `pdf2docx`'s own behavior.
+
+        Raises:
+            EntradaInvalidaError: `source` is not a `.pdf`, is missing/
+                empty, or `output`'s parent directory cannot be created.
+                Raised before any pymupdf/pdf2docx call.
+            PDFCorruptoError: `source` cannot be opened/parsed by
+                `pymupdf`, or `pdf2docx.Converter(...)` fails to
+                construct on it (same underlying raw exception).
+            PDFSinTextoError: `source` is a valid, parseable PDF with no
+                extractable text on any page (likely scanned/image-only).
+                Message suggests running OCR PDF first. `pdf2docx` is
+                never invoked for this input.
+            ConversionFallidaError: `pdf2docx` fails to convert an
+                otherwise-valid, native-text `source`. No partial
+                `output` file is left behind.
+        """
+        self._log.info("export start: %s", source.name)
+
+        self._require_nonempty_pdf(source)
+        self._make_output_dir(output.parent)
+
+        with self._translate_pdf_open_errors(source):
+            doc = pymupdf.open(source)
+            try:
+                text_chars = sum(len("".join(page.get_text().split())) for page in doc)
+            finally:
+                doc.close()
+
+        if text_chars < _MIN_TEXT_CHARS:
+            self._log.warning("export failed: no extractable text (%s)", source.name)
+            raise PDFSinTextoError(
+                f"{source.name!r} has no extractable text; run OCR PDF first."
+            )
+
+        with self._translate_pdf_open_errors(source):
+            cv = Converter(str(source))
+
+        with self._translate_conversion_errors(source, output):
+            cv.convert(str(output))
+        cv.close()
 
         self._log.info("export ok: %s -> %s", source.name, output.name)
         return output
