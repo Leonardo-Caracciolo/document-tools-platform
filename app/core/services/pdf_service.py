@@ -144,7 +144,6 @@ class PDFService:
             raise EntradaInvalidaError("No input files provided for merge.")
 
         self._log.info("merge start: %d input(s)", len(inputs))
-        self._make_output_dir(output.parent)
 
         merged = pikepdf.Pdf.new()
         for source in inputs:
@@ -152,6 +151,9 @@ class PDFService:
             with self._translate_errors("merge", source), pikepdf.Pdf.open(source) as pdf:
                 merged.pages.extend(pdf.pages)
 
+        # Validation happens before any write: an invalid input mustn't
+        # leave a newly-created (but never written) output directory behind.
+        self._make_output_dir(output.parent)
         merged.save(output)
         self._log.info("merge ok: %d page(s) -> %s", len(merged.pages), output.name)
         return output
@@ -166,11 +168,14 @@ class PDFService:
 
         `ranges` entries are 1-based, inclusive page ranges (`(start,
         end)`). `None` (default) produces one output file per page.
-        Validation (`_validate_pages`) runs after `source` is opened
-        (page count is only known then) but is a separate domain-error
-        path from `_translate_errors` — `EntradaInvalidaError` is never
-        one of the exception types `_translate_errors` maps, so raising
-        it from inside that context still propagates unwrapped.
+        All ranges are validated (bounds via `_validate_pages`, plus
+        `start <= end`) before any chunk is written — a later invalid
+        range can never leave an earlier chunk's file orphaned on disk.
+        Validation happens after `source` is opened (page count is only
+        known then) but is a separate domain-error path from
+        `_translate_errors` — `EntradaInvalidaError` is never one of the
+        exception types `_translate_errors` maps, so raising it from
+        inside that context still propagates unwrapped.
 
         Raises:
             `EntradaInvalidaError`: `source` is missing/0 bytes, `source`
@@ -180,7 +185,6 @@ class PDFService:
         """
         self._require_nonempty_file(source)
         self._log.info("split start: %s", source.name)
-        self._make_output_dir(output_dir)
 
         outputs: list[Path] = []
         with self._translate_errors("split", source), pikepdf.Pdf.open(source) as pdf:
@@ -192,12 +196,15 @@ class PDFService:
 
             pages_to_validate = [page for start, end in resolved_ranges for page in (start, end)]
             self._validate_pages(pages_to_validate, page_count, source)
-
             for start, end in resolved_ranges:
                 if start > end:
                     raise EntradaInvalidaError(
                         f"Invalid range ({start}, {end}) for {source.name!r}."
                     )
+
+            # All ranges validated: safe to create the output dir and write.
+            self._make_output_dir(output_dir)
+            for start, end in resolved_ranges:
                 chunk = pikepdf.Pdf.new()
                 chunk.pages.extend(pdf.pages[start - 1 : end])
                 suffix = f"page_{start}" if start == end else f"pages_{start}-{end}"

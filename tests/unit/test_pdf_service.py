@@ -272,3 +272,15 @@ class TestSplit:
 
         with pytest.raises(EntradaInvalidaError):
             service.split(source, tmp_path / "out")
+
+    def test_split_rejects_start_after_end_without_orphaning_earlier_chunks(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=5)
+        service = PDFService()
+        out_dir = tmp_path / "out"
+
+        with pytest.raises(EntradaInvalidaError, match=r"\(5, 3\)"):
+            service.split(source, out_dir, ranges=[(1, 2), (5, 3)])
+
+        assert not out_dir.exists()
