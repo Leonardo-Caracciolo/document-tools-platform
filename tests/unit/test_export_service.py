@@ -701,6 +701,30 @@ class TestPdfAExcelHappyPath:
         for record in info_records:
             assert str(tmp_path) not in record.getMessage()
 
+    def test_three_tables_produce_three_correctly_named_worksheets(
+        self, tmp_path: Path, table_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Regression for the `index == 1` / `else` sheet-naming branch:
+        the 2-table happy-path test above can't distinguish "renamed
+        .active for table 1, create_sheet for table 2" from a subtly
+        wrong off-by-one that would only surface at table 3+."""
+        tables = [
+            [["Alpha1", "Alpha2"]],
+            [["Beta1", "Beta2"]],
+            [["Gamma1", "Gamma2"]],
+        ]
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = table_pdf_factory("three_tables.pdf", tables)
+        output = tmp_path / "out.xlsx"
+
+        service.pdf_a_excel(source, output)
+
+        workbook = openpyxl.load_workbook(output)
+        assert workbook.sheetnames == ["Tabla1", "Tabla2", "Tabla3"]
+        for i, expected in enumerate(tables, start=1):
+            rows = [list(row) for row in workbook[f"Tabla{i}"].iter_rows(values_only=True)]
+            assert rows == expected
+
 
 class TestPdfAExcelValidation:
     def test_rejects_non_pdf_extension_before_processing(

@@ -259,6 +259,53 @@ class ExportService:
             self._log.warning("export failed: conversion error (%s)", source.name)
             raise ConversionFallidaError(f"Conversion of {source.name!r} failed.") from exc
 
+    def _require_extractable_pdf_text(self, source: Path) -> None:
+        """Raise `PDFSinTextoError` if `source` has no extractable text.
+
+        Shared by `pdf_a_word` and `pdf_a_excel` — both need the IDENTICAL
+        upfront scanned-PDF gate (accumulated non-whitespace `get_text()`
+        chars across all pages, threshold `_MIN_TEXT_CHARS`) before doing
+        any real work, and a fix to this logic (e.g. how whitespace is
+        stripped, or the `doc.close()` ordering) must apply to both at
+        once — a prior revision had this block copy-pasted verbatim in
+        both methods, which review flagged as a real drift risk (unlike
+        `PDFService`/`OCRService`'s deliberate "own copy, not shared"
+        convention BETWEEN services, this is a single shared helper
+        WITHIN one service, which doesn't cross that boundary).
+        """
+        with self._translate_pdf_open_errors(source):
+            doc = pymupdf.open(source)
+            try:
+                text_chars = sum(len("".join(page.get_text().split())) for page in doc)
+            finally:
+                doc.close()
+
+        if text_chars < _MIN_TEXT_CHARS:
+            self._log.warning("export failed: no extractable text (%s)", source.name)
+            raise PDFSinTextoError(
+                f"{source.name!r} has no extractable text; run OCR PDF first."
+            )
+
+    def _make_temp_output_path(self, output: Path, suffix: str) -> Path:
+        """Return a fresh empty temp file path next to `output`, or raise `EntradaInvalidaError`.
+
+        Shared by `pdf_a_word` and `pdf_a_excel` — both build their real
+        output into a temp file first, then `os.replace()` it onto
+        `output` only on success, so a pre-existing file at `output`
+        (e.g. the caller overwriting a prior successful run) is never
+        touched on a failure path — the fix for a real CRITICAL bug found
+        in `pdf_a_word`'s review round.
+        """
+        try:
+            fd, tmp_name = tempfile.mkstemp(suffix=suffix, dir=output.parent)
+            os.close(fd)
+        except OSError as exc:
+            self._log.warning("export failed: cannot create temp file (%s)", output.name)
+            raise EntradaInvalidaError(
+                f"Cannot create a temporary file near {output.name!r}."
+            ) from exc
+        return Path(tmp_name)
+
     def pdf_a_word(self, source: Path, output: Path) -> Path:
         """Convert `source` (`.pdf`) to a `.docx` at `output` via `pdf2docx`.
 
@@ -301,36 +348,13 @@ class ExportService:
 
         self._require_nonempty_pdf(source)
         self._make_output_dir(output.parent)
-
-        with self._translate_pdf_open_errors(source):
-            doc = pymupdf.open(source)
-            try:
-                text_chars = sum(len("".join(page.get_text().split())) for page in doc)
-            finally:
-                doc.close()
-
-        if text_chars < _MIN_TEXT_CHARS:
-            self._log.warning("export failed: no extractable text (%s)", source.name)
-            raise PDFSinTextoError(
-                f"{source.name!r} has no extractable text; run OCR PDF first."
-            )
+        self._require_extractable_pdf_text(source)
 
         with self._translate_pdf_open_errors(source):
             cv = Converter(str(source))
 
         try:
-            try:
-                fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=output.parent)
-                os.close(fd)
-            except OSError as exc:
-                self._log.warning(
-                    "export failed: cannot create temp file (%s)", source.name
-                )
-                raise EntradaInvalidaError(
-                    f"Cannot create a temporary file near {output.name!r}."
-                ) from exc
-
-            tmp_path = Path(tmp_name)
+            tmp_path = self._make_temp_output_path(output, ".docx")
             try:
                 with self._translate_conversion_errors(source):
                     cv.convert(str(tmp_path))
@@ -421,19 +445,7 @@ class ExportService:
 
         self._require_nonempty_pdf(source)
         self._make_output_dir(output.parent)
-
-        with self._translate_pdf_open_errors(source):
-            doc = pymupdf.open(source)
-            try:
-                text_chars = sum(len("".join(page.get_text().split())) for page in doc)
-            finally:
-                doc.close()
-
-        if text_chars < _MIN_TEXT_CHARS:
-            self._log.warning("export failed: no extractable text (%s)", source.name)
-            raise PDFSinTextoError(
-                f"{source.name!r} has no extractable text; run OCR PDF first."
-            )
+        self._require_extractable_pdf_text(source)
 
         with (
             self._translate_table_extraction_errors(source),
@@ -447,16 +459,7 @@ class ExportService:
             self._log.warning("export failed: no detectable tables (%s)", source.name)
             raise PDFSinTablasError(f"{source.name!r} has no detectable tables.")
 
-        try:
-            fd, tmp_name = tempfile.mkstemp(suffix=".xlsx", dir=output.parent)
-            os.close(fd)
-        except OSError as exc:
-            self._log.warning("export failed: cannot create temp file (%s)", source.name)
-            raise EntradaInvalidaError(
-                f"Cannot create a temporary file near {output.name!r}."
-            ) from exc
-
-        tmp_path = Path(tmp_name)
+        tmp_path = self._make_temp_output_path(output, ".xlsx")
         try:
             with self._translate_table_extraction_errors(source):
                 workbook = openpyxl.Workbook()
