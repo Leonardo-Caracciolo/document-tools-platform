@@ -609,6 +609,32 @@ class TestJpgToPdf:
 
         assert not output.parent.exists()
 
+    def test_jpg_to_pdf_rejects_img2pdf_convert_failure_without_orphaning_output_dir(
+        self,
+        tmp_path: Path,
+        jpg_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression: `Image.verify()` only checks header/structure — it
+        does not guarantee `img2pdf.convert()` will succeed. An image
+        that passes `verify()` but fails conversion must still be
+        rejected WITHOUT the output dir having been created, and without
+        blaming a specific (possibly wrong) file in the error message."""
+        first = jpg_factory("first.jpg")
+        second = jpg_factory("second.jpg")
+        service = PDFService()
+        output = tmp_path / "out" / "images.pdf"
+
+        def _raise(*_args: object, **_kwargs: object) -> bytes:
+            raise img2pdf.ImageOpenError("simulated post-verify conversion failure")
+
+        monkeypatch.setattr(img2pdf, "convert", _raise)
+
+        with pytest.raises(EntradaInvalidaError, match="One or more input images"):
+            service.jpg_to_pdf([first, second], output)
+
+        assert not output.parent.exists()
+
 
 class TestCrossCuttingLoggingAndExceptionContainment:
     """Cross-cutting tests (4.3/4.4) exercised across all six operations.

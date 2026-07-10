@@ -339,18 +339,26 @@ class PDFService:
         """Convert `images` into one PDF at `output`, one page per image, in order.
 
         Every image is verified with Pillow's `Image.verify()` BEFORE
-        `img2pdf.convert()` is called — same validate-then-write
-        convention as the other five operations: a corrupt image late
-        in `images` must not leave a partial output file or an orphaned
-        output directory behind. `Image.verify()` only checks the file
-        header/structure and cannot be reused afterward, but that's
-        fine here since this pass exists purely to validate, not to
-        decode pixel data for later use.
+        `img2pdf.convert()` is called. `Image.verify()` only checks the
+        file header/structure, though — it does NOT guarantee
+        `img2pdf.convert()` will succeed (a file can pass `verify()` and
+        still fail conversion). So `_make_output_dir` runs only after
+        `img2pdf.convert()` itself has returned successfully, not merely
+        after the `verify()` pass — otherwise a conversion failure could
+        still leave an orphaned, empty output directory behind, same
+        validate-then-write convention as the other five operations.
+
+        A conversion failure can't be reliably attributed to one image
+        in `images` (`img2pdf.convert()` processes the whole list as a
+        unit), so its error message deliberately does not name a
+        specific file — naming the wrong one would be worse than naming
+        none.
 
         Raises:
             `EntradaInvalidaError`: `images` is empty, any image is
                 missing/0 bytes (`_require_nonempty_file`), any image
-                is not a valid/decodable image, or `output`'s parent
+                fails `Image.verify()`, `img2pdf.convert()` cannot
+                convert one or more images, or `output`'s parent
                 directory cannot be created.
         """
         if not images:
@@ -363,10 +371,19 @@ class PDFService:
             with self._translate_errors("jpg_to_pdf", image), Image.open(image) as img:
                 img.verify()
 
-        # All images validated: safe to create the output dir and write.
-        self._make_output_dir(output.parent)
-        with self._translate_errors("jpg_to_pdf", images[0]):
+        try:
             pdf_bytes = img2pdf.convert([str(image) for image in images])
+        except (img2pdf.ImageOpenError, img2pdf.AlphaChannelError) as exc:
+            self._log.warning(
+                "jpg_to_pdf failed: unsupported image among %d input(s)", len(images)
+            )
+            raise EntradaInvalidaError(
+                "One or more input images cannot be converted to PDF."
+            ) from exc
+
+        # Conversion succeeded: only now is it safe to create the output
+        # dir and write — see docstring for why this can't happen earlier.
+        self._make_output_dir(output.parent)
         output.write_bytes(pdf_bytes)
 
         self._log.info("jpg_to_pdf ok: %d image(s) -> %s", len(images), output.name)
