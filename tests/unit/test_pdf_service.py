@@ -1,9 +1,9 @@
 """Tests for `app.core.services.pdf_service`.
 
 Covers the PR1 foundation (constructor, `_translate_errors` mapping,
-`_validate_pages` helper) plus the PR2 `merge`/`split` operations.
-`organize`/`protect`/`unlock`/`jpg_to_pdf` are implemented in later
-Sprint 1 PRs and have no tests here yet.
+`_validate_pages` helper), the PR2 `merge`/`split` operations, and the
+PR3 `organize`/`protect`/`unlock` operations. `jpg_to_pdf` is
+implemented in a later Sprint 1 PR and has no tests here yet.
 """
 
 from __future__ import annotations
@@ -284,3 +284,205 @@ class TestSplit:
             service.split(source, out_dir, ranges=[(1, 2), (5, 3)])
 
         assert not out_dir.exists()
+
+
+class TestOrganize:
+    """Tests for `PDFService.organize`."""
+
+    def test_organize_reorders_pages_per_spec(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+        output = tmp_path / "organized.pdf"
+
+        result = service.organize(source, output, order=[3, 1, 2])
+
+        assert result == output
+        with pikepdf.Pdf.open(output) as organized:
+            assert len(organized.pages) == 3
+
+    def test_organize_can_drop_pages_not_referenced_in_order(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+        output = tmp_path / "organized.pdf"
+
+        service.organize(source, output, order=[2])
+
+        with pikepdf.Pdf.open(output) as organized:
+            assert len(organized.pages) == 1
+
+    def test_organize_raises_entrada_invalida_for_out_of_range_index(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="5"):
+            service.organize(source, tmp_path / "organized.pdf", order=[1, 5])
+
+    def test_organize_raises_entrada_invalida_for_duplicate_index(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="Duplicate"):
+            service.organize(source, tmp_path / "organized.pdf", order=[1, 1, 2])
+
+    def test_organize_raises_entrada_invalida_for_empty_order(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.organize(source, tmp_path / "organized.pdf", order=[])
+
+    def test_organize_raises_entrada_invalida_for_empty_source_file(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.organize(source, tmp_path / "organized.pdf", order=[1])
+
+    def test_organize_rejects_out_of_range_index_without_orphaning_output_dir(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+        output = tmp_path / "out" / "organized.pdf"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.organize(source, output, order=[1, 4])
+
+        assert not output.parent.exists()
+
+
+class TestProtect:
+    """Tests for `PDFService.protect`."""
+
+    def test_protect_produces_aes256_encrypted_pdf_requiring_password(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=2)
+        service = PDFService()
+        output = tmp_path / "protected.pdf"
+
+        result = service.protect(source, output, owner_password="secret")
+
+        assert result == output
+        with pytest.raises(pikepdf.PasswordError):
+            pikepdf.Pdf.open(output)
+        with pikepdf.Pdf.open(output, password="secret") as opened:
+            assert opened.is_encrypted
+            assert opened.encryption.R == 6
+            assert opened.encryption.bits == 256
+
+    def test_protect_supports_distinct_owner_and_user_passwords(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        output = tmp_path / "protected.pdf"
+
+        service.protect(source, output, owner_password="owner-pwd", user_password="user-pwd")
+
+        with pikepdf.Pdf.open(output, password="user-pwd") as opened:
+            assert opened.is_encrypted
+
+    def test_protect_raises_archivo_protegido_for_already_encrypted_input(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = encrypted_pdf_factory("locked.pdf", owner="o", user="u")
+        service = PDFService()
+
+        with pytest.raises(ArchivoProtegidoError):
+            service.protect(source, tmp_path / "protected.pdf", owner_password="secret")
+
+    def test_protect_raises_entrada_invalida_for_empty_password(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.protect(source, tmp_path / "protected.pdf", owner_password="")
+
+    def test_protect_raises_entrada_invalida_for_blank_password(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.protect(source, tmp_path / "protected.pdf", owner_password="   ")
+
+    def test_protect_raises_entrada_invalida_for_empty_source_file(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.protect(source, tmp_path / "protected.pdf", owner_password="secret")
+
+
+class TestUnlock:
+    """Tests for `PDFService.unlock`."""
+
+    def test_unlock_removes_password_protection(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = encrypted_pdf_factory("locked.pdf", owner="owner-pwd", user="user-pwd")
+        service = PDFService()
+        output = tmp_path / "unlocked.pdf"
+
+        result = service.unlock(source, output, password="user-pwd")
+
+        assert result == output
+        with pikepdf.Pdf.open(output) as opened:
+            assert not opened.is_encrypted
+
+    def test_unlock_accepts_owner_password(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = encrypted_pdf_factory("locked.pdf", owner="owner-pwd", user="user-pwd")
+        service = PDFService()
+        output = tmp_path / "unlocked.pdf"
+
+        service.unlock(source, output, password="owner-pwd")
+
+        with pikepdf.Pdf.open(output) as opened:
+            assert not opened.is_encrypted
+
+    def test_unlock_raises_contrasena_invalida_for_wrong_password(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = encrypted_pdf_factory("locked.pdf", owner="owner-pwd", user="user-pwd")
+        service = PDFService()
+
+        with pytest.raises(ContrasenaInvalidaError):
+            service.unlock(source, tmp_path / "unlocked.pdf", password="wrong")
+
+    def test_unlock_raises_entrada_invalida_for_non_encrypted_input(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.unlock(source, tmp_path / "unlocked.pdf", password="whatever")
+
+    def test_unlock_raises_entrada_invalida_for_empty_source_file(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.unlock(source, tmp_path / "unlocked.pdf", password="whatever")

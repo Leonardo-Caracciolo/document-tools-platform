@@ -10,10 +10,9 @@ at a single, scoped boundary (`_translate_errors`) so no raw
 Stateless and thread-safe: no config injection, no internal
 `TaskRunner.submit()` calls — a future UI composes
 `runner.submit(service.merge, ...)` instead of the service wrapping
-itself (see SSD §5.2). `organize`/`protect`/`unlock`/`jpg_to_pdf` land in
-later Sprint 1 PRs. Every operation MUST call `_require_nonempty_file`
-before opening its input(s) with `pikepdf`/Pillow — see that method's
-docstring for why.
+itself (see SSD §5.2). `jpg_to_pdf` lands in a later Sprint 1 PR. Every
+operation MUST call `_require_nonempty_file` before opening its
+input(s) with `pikepdf`/Pillow — see that method's docstring for why.
 """
 
 from __future__ import annotations
@@ -214,3 +213,115 @@ class PDFService:
 
         self._log.info("split ok: %d output(s) -> %s", len(outputs), output_dir.name)
         return outputs
+
+    def organize(self, source: Path, output: Path, order: Sequence[int]) -> Path:
+        """Reorder/remove pages in `source` per `order`, writing the result to `output`.
+
+        `order` is a sequence of 1-based page numbers, order-significant:
+        the output contains exactly `len(order)` pages, in that order.
+        Each source page may appear at most once — duplicates are
+        rejected rather than silently allowed, so a caller can't
+        accidentally end up with a page repeated in the output.
+        Validation (bounds via `_validate_pages`, plus the duplicate
+        check) runs in one pass, after `source` is opened (page count is
+        only known then) and before any write — same convention as
+        `split`.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, `order`
+                is empty, any entry is out of range, `order` contains a
+                duplicate page number, or `output`'s parent directory
+                cannot be created.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source)
+        self._log.info("organize start: %s", source.name)
+
+        with self._translate_errors("organize", source), pikepdf.Pdf.open(source) as pdf:
+            page_count = len(pdf.pages)
+            self._validate_pages(order, page_count, source)
+            if len(set(order)) != len(order):
+                raise EntradaInvalidaError(
+                    f"Duplicate page number(s) in order spec for {source.name!r}."
+                )
+
+            # All entries validated: safe to create the output dir and write.
+            self._make_output_dir(output.parent)
+            reorganized = pikepdf.Pdf.new()
+            reorganized.pages.extend(pdf.pages[page - 1] for page in order)
+            reorganized.save(output)
+
+        self._log.info("organize ok: %d page(s) -> %s", len(order), output.name)
+        return output
+
+    def protect(
+        self,
+        source: Path,
+        output: Path,
+        owner_password: str,
+        user_password: str | None = None,
+    ) -> Path:
+        """Encrypt `source` with AES-256 (`Encryption(R=6)`), writing to `output`.
+
+        `user_password` defaults to `owner_password` when omitted, so the
+        output always requires a password to open. An already-encrypted
+        `source` cannot be opened without its own password, so
+        `pikepdf.Pdf.open` raises `pikepdf.PasswordError` for it here;
+        `_translate_errors` maps that to `ArchivoProtegidoError` for any
+        op other than `"unlock"` — the caller must `unlock` first.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes,
+                `owner_password` is empty/blank, or `output`'s parent
+                directory cannot be created.
+            `ArchivoProtegidoError`: `source` is already password-protected.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source)
+        if not owner_password or not owner_password.strip():
+            raise EntradaInvalidaError("Password must not be empty.")
+
+        self._log.info("protect start: %s", source.name)
+
+        with self._translate_errors("protect", source), pikepdf.Pdf.open(source) as pdf:
+            # Opening `source` above is the only validation this op needs
+            # (an already-encrypted source fails there) — safe to write now.
+            self._make_output_dir(output.parent)
+            pdf.save(
+                output,
+                encryption=pikepdf.Encryption(
+                    owner=owner_password,
+                    user=user_password if user_password is not None else owner_password,
+                    R=6,
+                ),
+            )
+
+        self._log.info("protect ok: %s -> %s", source.name, output.name)
+        return output
+
+    def unlock(self, source: Path, output: Path, password: str) -> Path:
+        """Remove password protection from `source`, writing to `output`.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, `source`
+                is not password-protected, or `output`'s parent
+                directory cannot be created.
+            `ContrasenaInvalidaError`: `password` does not match `source`'s password.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source)
+        self._log.info("unlock start: %s", source.name)
+
+        with (
+            self._translate_errors("unlock", source),
+            pikepdf.Pdf.open(source, password=password) as pdf,
+        ):
+            if not pdf.is_encrypted:
+                raise EntradaInvalidaError(f"{source.name!r} is not password-protected.")
+
+            # Password verified and encryption confirmed: safe to write now.
+            self._make_output_dir(output.parent)
+            pdf.save(output)
+
+        self._log.info("unlock ok: %s -> %s", source.name, output.name)
+        return output
