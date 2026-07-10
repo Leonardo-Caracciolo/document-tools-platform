@@ -13,6 +13,7 @@ dependencies = [
     "pikepdf>=9",
     "img2pdf",
     "Pillow",
+    "pymupdf>=1.24.9,<2",
 ]
 
 [dependency-groups]

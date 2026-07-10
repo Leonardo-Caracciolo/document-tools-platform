@@ -2,9 +2,9 @@
 
 Covers the PR1 foundation (constructor, `_translate_errors` mapping,
 `_validate_pages` helper), the PR2 `merge`/`split` operations, the PR3
-`organize`/`protect`/`unlock` operations, and the PR4 `jpg_to_pdf`
-operation plus cross-cutting logging/exception-containment tests
-exercised across all six operations.
+`organize`/`protect`/`unlock` operations, the PR4 `jpg_to_pdf`
+operation, the `compress` operation, plus cross-cutting logging/
+exception-containment tests exercised across all seven operations.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from pathlib import Path
 
 import img2pdf
 import pikepdf
+import pymupdf
 import pytest
 from PIL import UnidentifiedImageError
 
@@ -634,6 +635,160 @@ class TestJpgToPdf:
             service.jpg_to_pdf([first, second], output)
 
         assert not output.parent.exists()
+
+
+class TestCompress:
+    """Tests for `PDFService.compress`."""
+
+    def test_compress_shrinks_image_heavy_pdf(
+        self, tmp_path: Path, image_heavy_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = image_heavy_pdf_factory("heavy.pdf")
+        service = PDFService()
+        output = tmp_path / "compressed.pdf"
+
+        result = service.compress(source, output)
+
+        assert result == output
+        assert output.exists()
+        assert output.stat().st_size < source.stat().st_size
+
+    def test_compress_logs_info_start_and_ok(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        image_heavy_pdf_factory: Callable[..., Path],
+    ) -> None:
+        source = image_heavy_pdf_factory("heavy.pdf")
+        service = PDFService()
+        output = tmp_path / "compressed.pdf"
+
+        with caplog.at_level(logging.INFO, logger="app.core.services.pdf_service"):
+            service.compress(source, output)
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any("start" in r.getMessage() for r in info_records)
+        assert any("ok" in r.getMessage() for r in info_records)
+        for record in info_records:
+            assert str(tmp_path) not in record.getMessage()
+
+    def test_compress_text_only_pdf_succeeds_without_raising(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """A freshly `pikepdf`-serialized text-only PDF is NOT already at a
+        structural fixed point — `pymupdf`'s `garbage=4, clean=True`
+        object/xref cleanup measurably shrinks it (~35% smaller in local
+        verification) even with zero embedded images, because the two
+        libraries serialize PDF structure differently. That is a
+        legitimate, spec-compliant size reduction (Requirement: Size
+        Reduction), not the never-grow fallback — so this scenario
+        verifies the general success contract (no exception, `Path`
+        returned, output no bigger than source, INFO ok logged) rather
+        than asserting byte-identical, which only the no-gain fallback
+        path guarantees (see `test_compress_never_grows_...` below)."""
+        source = valid_pdf_factory("text_only.pdf", pages=3)
+        service = PDFService()
+        output = tmp_path / "compressed.pdf"
+
+        result = service.compress(source, output)
+
+        assert result == output
+        assert output.exists()
+        assert output.stat().st_size <= source.stat().st_size
+
+    def test_compress_never_grows_text_only_pdf_at_fixed_point_is_byte_identical(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Once a text-only PDF has already been through one `compress`
+        pass, `pymupdf`'s recompression reaches a structural fixed point
+        (verified empirically: a second pass produces an identical byte
+        count) — recompressing it again must hit the never-grow fallback
+        and copy the original bytes exactly."""
+        original = valid_pdf_factory("text_only.pdf", pages=3)
+        service = PDFService()
+        once = tmp_path / "compressed_once.pdf"
+        service.compress(original, once)
+
+        twice = tmp_path / "compressed_twice.pdf"
+        result = service.compress(once, twice)
+
+        assert result == twice
+        assert twice.read_bytes() == once.read_bytes()
+
+    def test_compress_never_grows_already_optimized_pdf_is_byte_identical(
+        self, tmp_path: Path, image_heavy_pdf_factory: Callable[..., Path]
+    ) -> None:
+        original = image_heavy_pdf_factory("heavy.pdf")
+        service = PDFService()
+        once = tmp_path / "compressed_once.pdf"
+        service.compress(original, once)
+
+        twice = tmp_path / "compressed_twice.pdf"
+        result = service.compress(once, twice)
+
+        assert result == twice
+        assert twice.read_bytes() == once.read_bytes()
+
+    def test_compress_raises_archivo_protegido_for_encrypted_input(
+        self, tmp_path: Path, encrypted_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = encrypted_pdf_factory("locked.pdf", owner="o", user="u")
+        service = PDFService()
+        output = tmp_path / "compressed.pdf"
+
+        with pytest.raises(ArchivoProtegidoError):
+            service.compress(source, output)
+
+        assert not output.exists()
+
+    def test_compress_raises_pdf_corrupto_naming_offending_file(
+        self, tmp_path: Path, corrupt_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = corrupt_pdf_factory("corrupt.pdf")
+        service = PDFService()
+
+        with pytest.raises(PDFCorruptoError, match="corrupt.pdf"):
+            service.compress(source, tmp_path / "compressed.pdf")
+
+    def test_compress_raises_entrada_invalida_for_missing_input(self, tmp_path: Path) -> None:
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.compress(tmp_path / "does-not-exist.pdf", tmp_path / "compressed.pdf")
+
+    def test_compress_raises_entrada_invalida_for_empty_input(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.compress(source, tmp_path / "compressed.pdf")
+
+    def test_compress_raises_entrada_invalida_for_bad_output_dir(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf")
+        service = PDFService()
+        blocked_by_file = tmp_path / "blocked_by_file"
+        blocked_by_file.write_bytes(b"not a directory")
+        output = blocked_by_file / "sub" / "compressed.pdf"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.compress(source, output)
+
+    def test_compress_does_not_let_raw_pymupdf_exceptions_escape(
+        self, tmp_path: Path, corrupt_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = corrupt_pdf_factory("corrupt.pdf")
+        service = PDFService()
+
+        with pytest.raises(PDFCorruptoError) as exc_info:
+            service.compress(source, tmp_path / "compressed.pdf")
+
+        assert not isinstance(
+            exc_info.value, (pymupdf.FileDataError, pymupdf.EmptyFileError, RuntimeError)
+        )
 
 
 class TestCrossCuttingLoggingAndExceptionContainment:

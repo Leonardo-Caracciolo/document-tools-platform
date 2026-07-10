@@ -7,8 +7,11 @@ repository — every fixture artifact is generated on the fly.
 
 from __future__ import annotations
 
+import io
+import os
 from pathlib import Path
 
+import img2pdf
 import pikepdf
 from PIL import Image
 
@@ -46,6 +49,26 @@ def make_empty_file(path: Path) -> Path:
 def make_jpg(path: Path) -> Path:
     """Write a valid, minimal JPEG image to `path`."""
     Image.new("RGB", (64, 64), "white").save(path, "JPEG")
+    return path
+
+
+def make_image_heavy_pdf(path: Path) -> Path:
+    """Write a single-page PDF embedding a large, high-quality raster image to `path`.
+
+    The image is ~2000x2000 random-noise pixels saved at JPEG quality 95 —
+    empirically confirmed (Sprint `compress-pdf` design/orchestrator
+    verification) as the size/quality floor needed to guarantee
+    `PDFService.compress`'s `rewrite_images(dpi_target=150, quality=75)`
+    actually shrinks the result. Random noise (rather than a flat color)
+    keeps the source JPEG large and not already near-maximally compressed.
+    """
+    pixels = os.urandom(2000 * 2000 * 3)
+    image = Image.frombytes("RGB", (2000, 2000), pixels)
+
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=95)
+
+    path.write_bytes(img2pdf.convert(buffer.getvalue()))
     return path
 
 

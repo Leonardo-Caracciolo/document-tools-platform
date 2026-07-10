@@ -16,6 +16,7 @@ from tests.fixtures.pdf_factory import (
     make_corrupt_pdf,
     make_empty_file,
     make_encrypted_pdf,
+    make_image_heavy_pdf,
     make_jpg,
     make_valid_pdf,
 )
@@ -79,5 +80,15 @@ def corrupt_jpg_factory(tmp_path: Path) -> Callable[..., Path]:
 
     def _make(name: str = "corrupt.jpg") -> Path:
         return make_corrupt_jpg(tmp_path / name)
+
+    return _make
+
+
+@pytest.fixture
+def image_heavy_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes an image-heavy PDF under `tmp_path`."""
+
+    def _make(name: str = "image_heavy.pdf") -> Path:
+        return make_image_heavy_pdf(tmp_path / name)
 
     return _make

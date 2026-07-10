@@ -1,18 +1,19 @@
 """PDF/image operations service, per SSD §3.1/§4.1/§5.1.
 
-`PDFService` exposes six pure, synchronous methods over `pikepdf`
-(merge/split/organize/protect/unlock) and `img2pdf`+`Pillow`
-(jpg_to_pdf). Every method returns the written output path(s). Library
-exceptions are translated to domain exceptions (`app.core.exceptions`)
-at a single, scoped boundary (`_translate_errors`) so no raw
-`pikepdf`/`img2pdf`/`Pillow` exception ever reaches a caller.
+`PDFService` exposes seven pure, synchronous methods over `pikepdf`
+(merge/split/organize/protect/unlock), `img2pdf`+`Pillow`
+(jpg_to_pdf), and `pymupdf` (compress). Every method returns the
+written output path(s). Library exceptions are translated to domain
+exceptions (`app.core.exceptions`) at scoped boundaries
+(`_translate_errors` for pikepdf/img2pdf/Pillow, `_translate_fitz_errors`
+for pymupdf) so no raw library exception ever reaches a caller.
 
 Stateless and thread-safe: no config injection, no internal
 `TaskRunner.submit()` calls — a future UI composes
 `runner.submit(service.merge, ...)` instead of the service wrapping
 itself (see SSD §5.2). Every operation MUST call
 `_require_nonempty_file` before opening its input(s) with
-`pikepdf`/Pillow — see that method's docstring for why.
+`pikepdf`/Pillow/`pymupdf` — see that method's docstring for why.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Literal
 
 import img2pdf
 import pikepdf
+import pymupdf
 from PIL import Image, UnidentifiedImageError
 
 from app.core.exceptions import (
@@ -34,11 +36,19 @@ from app.core.exceptions import (
 )
 from app.infrastructure.logger import get_logger
 
-#: The six operations `_translate_errors` can be called for. A closed
-#: `Literal` instead of a bare `str` so a typo'd op name (e.g. "unlok")
-#: fails type-checking instead of silently falling into the wrong
-#: exception branch below.
-Operation = Literal["merge", "split", "organize", "protect", "unlock", "jpg_to_pdf"]
+#: The seven operations `_translate_errors`/`_translate_fitz_errors` can be
+#: called for. A closed `Literal` instead of a bare `str` so a typo'd op
+#: name (e.g. "unlok") fails type-checking instead of silently falling
+#: into the wrong exception branch below.
+Operation = Literal[
+    "merge", "split", "organize", "protect", "unlock", "jpg_to_pdf", "compress"
+]
+
+#: `compress` recompression targets — see design's "Balanced constants"
+#: decision: 150 DPI is the on-screen/email sweet spot for scans/
+#: screenshots, JPEG quality 75 is the standard near-lossless threshold.
+_COMPRESS_DPI = 150
+_COMPRESS_JPEG_QUALITY = 75
 
 
 class PDFService:
@@ -87,6 +97,29 @@ class PDFService:
         except (img2pdf.ImageOpenError, img2pdf.AlphaChannelError) as exc:
             self._log.warning("%s failed: unsupported image (%s)", op, source.name)
             raise EntradaInvalidaError(f"{source.name!r} cannot be converted to PDF.") from exc
+
+    @contextmanager
+    def _translate_fitz_errors(self, op: Operation, source: Path) -> Generator[None, None, None]:
+        """Map `pymupdf` exceptions raised while performing `op` on `source`.
+
+        Separate from `_translate_errors` by design: that context manager
+        is a clean, tested `pikepdf`/`img2pdf`/`Pillow` boundary that maps
+        a bare `OSError` -> `EntradaInvalidaError`; wrapping `pymupdf`
+        calls in it would mis-map `pymupdf`'s own `OSError`/`RuntimeError`
+        subclasses and force the `pymupdf` import into unrelated methods.
+        A dedicated context manager isolates the new library and keeps
+        the six existing operations' `_translate_errors` invariant
+        untouched.
+
+        Mapping:
+            `pymupdf.FileDataError`, `pymupdf.EmptyFileError` (and their
+            `RuntimeError` base) -> `PDFCorruptoError`
+        """
+        try:
+            yield
+        except (pymupdf.FileDataError, pymupdf.EmptyFileError, RuntimeError) as exc:
+            self._log.warning("%s failed: corrupt PDF (%s)", op, source.name)
+            raise PDFCorruptoError(f"{source.name!r} is corrupt or unreadable.") from exc
 
     def _require_nonempty_file(self, source: Path, op: Operation | None = None) -> None:
         """Raise `EntradaInvalidaError` if `source` is missing or 0 bytes.
@@ -421,4 +454,59 @@ class PDFService:
         output.write_bytes(pdf_bytes)
 
         self._log.info("jpg_to_pdf ok: %d image(s) -> %s", len(images), output.name)
+        return output
+
+    def compress(self, source: Path, output: Path) -> Path:
+        """Recompress `source`'s embedded images/fonts, writing the smaller
+        of the recompressed candidate or the original bytes to `output`.
+
+        The recompressed candidate is built entirely in memory
+        (`Document.tobytes(...)`) and its size is compared to `source`'s
+        on-disk size BEFORE anything is written — a never-grow guarantee.
+        When recompression does not shrink the file (already-optimized
+        or text-only input), `output` receives a literal byte-for-byte
+        copy of `source`, never a re-save, so it stays bytes-identical
+        to the original. The start log deliberately runs BEFORE
+        `_require_nonempty_file` (spec-mandated ordering, unlike the six
+        other operations which validate first).
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, or
+                `output`'s parent directory cannot be created.
+            `ArchivoProtegidoError`: `source` is password-protected.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._log.info("compress start: %s", source.name)
+        self._require_nonempty_file(source, "compress")
+
+        with self._translate_fitz_errors("compress", source):
+            doc = pymupdf.open(source)
+            try:
+                if doc.needs_pass or doc.is_encrypted:
+                    self._log.warning(
+                        "compress failed: password-protected input (%s)", source.name
+                    )
+                    raise ArchivoProtegidoError(
+                        f"{source.name!r} is password-protected; unlock it first."
+                    )
+                doc.rewrite_images(dpi_target=_COMPRESS_DPI, quality=_COMPRESS_JPEG_QUALITY)
+                doc.subset_fonts()
+                candidate = doc.tobytes(
+                    garbage=4,
+                    deflate=True,
+                    deflate_images=True,
+                    deflate_fonts=True,
+                    clean=True,
+                    use_objstms=1,
+                )
+            finally:
+                doc.close()
+
+        payload = candidate if len(candidate) < source.stat().st_size else source.read_bytes()
+
+        # Validated and decided: safe to create the output dir and write.
+        self._make_output_dir(output.parent, "compress")
+        output.write_bytes(payload)
+
+        self._log.info("compress ok: %s -> %s", source.name, output.name)
         return output
