@@ -14,6 +14,8 @@ tracebacks.
 callers as raw tracebacks. `PDFSinTextoError` is also raised by
 `app.core.services.export_service`, alongside `PDFCorruptoError` and
 `ConversionFallidaError`, for its `.pdf` -> `.docx` direction.
+`PDFSinTablasError` is raised alongside these for its `.pdf` -> `.xlsx`
+direction, when a PDF has extractable text but no detectable tables.
 
 `OCRNoDisponibleError` and `OCRFallidaError` are raised by
 `app.core.services.ocr_service` so `pytesseract`/Tesseract subprocess
@@ -53,6 +55,10 @@ class ConversionFallidaError(Exception):
 
 class PDFSinTextoError(Exception):
     """Raised when a PDF has no extractable text layer (likely scanned or image-only)."""
+
+
+class PDFSinTablasError(Exception):
+    """Raised when a PDF has extractable text but no detectable tables to export."""
 
 
 class OCRNoDisponibleError(Exception):

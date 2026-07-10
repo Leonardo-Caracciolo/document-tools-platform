@@ -47,6 +47,46 @@ def make_native_text_pdf(path: Path, text: str) -> Path:
     return path
 
 
+def make_table_pdf(path: Path, tables: list[list[list[str]]]) -> Path:
+    """Write a PDF with one ruled-grid table per page to `path`.
+
+    Each entry in `tables` becomes its own page: a ruled grid drawn via
+    `page.draw_line()` (horizontal + vertical cell boundaries) with every
+    cell's value placed via `page.insert_text()`. Confirmed during
+    `sdd/pdf-to-excel/design`'s empirical pass: this construction is
+    detected correctly by `pdfplumber.extract_tables()` under DEFAULT
+    settings — no `table_settings` override needed. Row/column counts may
+    vary per table; ragged rows (fewer cells than the widest row) are
+    supported, matching `pdfplumber`'s own `Optional[str]` cell shape.
+    """
+    left, top = 72, 72
+    cell_width, cell_height = 100, 24
+
+    doc = pymupdf.open()
+    try:
+        for table in tables:
+            n_rows = len(table)
+            n_cols = max((len(row) for row in table), default=0)
+            page = doc.new_page(width=612, height=792)
+
+            for row_index in range(n_rows + 1):
+                y = top + row_index * cell_height
+                page.draw_line((left, y), (left + n_cols * cell_width, y))
+            for col_index in range(n_cols + 1):
+                x = left + col_index * cell_width
+                page.draw_line((x, top), (x, top + n_rows * cell_height))
+
+            for row_index, row in enumerate(table):
+                for col_index, value in enumerate(row):
+                    x = left + col_index * cell_width + 4
+                    y = top + row_index * cell_height + cell_height - 8
+                    page.insert_text((x, y), str(value))
+        doc.save(path)
+    finally:
+        doc.close()
+    return path
+
+
 def make_encrypted_pdf(path: Path, owner: str = "o", user: str = "u", pages: int = 1) -> Path:
     """Write a PDF encrypted with `owner`/`user` passwords to `path`."""
     pdf = pikepdf.Pdf.new()

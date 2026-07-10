@@ -22,6 +22,11 @@ abstraction exists for it, no cloud/local split), the same way
 `PDFService` calls `pikepdf`/`pymupdf` directly. It does NOT participate
 in `_PROVIDERS`/the `convertir` provider factory, and `convertir`'s own
 behavior is untouched by it.
+
+`pdf_a_excel` (`sdd/pdf-to-excel/design`) is a THIRD, additive method: it
+calls `pdfplumber` (table extraction) and `openpyxl` (writing) directly,
+the same pattern as `pdf_a_word`. It does not touch `convertir` or
+`pdf_a_word`.
 """
 
 from __future__ import annotations
@@ -32,6 +37,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
+import openpyxl
+import pdfplumber
 import pymupdf
 from pdf2docx import Converter
 
@@ -40,6 +47,7 @@ from app.core.exceptions import (
     ConversorNoDisponibleError,
     EntradaInvalidaError,
     PDFCorruptoError,
+    PDFSinTablasError,
     PDFSinTextoError,
 )
 from app.core.providers.azure_doc_converter_provider import AzureDocConverterProvider
@@ -340,6 +348,137 @@ class ExportService:
                 raise
         finally:
             cv.close()
+
+        self._log.info("export ok: %s -> %s", source.name, output.name)
+        return output
+
+    @contextmanager
+    def _translate_table_extraction_errors(self, source: Path) -> Generator[None, None, None]:
+        """Map raw `pdfplumber`/`openpyxl` exceptions raised while extracting or writing.
+
+        Scoped to wrap TWO separate blocks in `pdf_a_excel`: the
+        `pdfplumber` table-extraction block, and the `openpyxl`
+        build-and-save-to-temp block. Unlike `pdf_a_word` (where
+        corrupt-open and conversion failures map to different domain
+        exceptions), the spec's "Extraction/Write Failure Containment"
+        requirement assigns BOTH pdfplumber and openpyxl failures to the
+        SAME target, so one context manager is correct here — no need to
+        reuse `_translate_conversion_errors`, which belongs to the
+        `pdf2docx` path and names itself accordingly.
+
+        `PDFSinTablasError` is raised OUTSIDE this context manager, between
+        the two wrapped blocks (see `pdf_a_excel`), so it is never caught
+        here — a broad `except Exception` inside this boundary would
+        otherwise wrongly re-translate it into `ConversionFallidaError`.
+
+        Mapping:
+            any exception -> `ConversionFallidaError`, filename-only warning
+        """
+        try:
+            yield
+        except Exception as exc:
+            self._log.warning("export failed: table extraction error (%s)", source.name)
+            raise ConversionFallidaError(
+                f"Table extraction/export for {source.name!r} failed."
+            ) from exc
+
+    def pdf_a_excel(self, source: Path, output: Path) -> Path:
+        """Extract detected tables from `source` (`.pdf`) into a multi-sheet `.xlsx` at `output`.
+
+        Detects, BEFORE attempting table extraction, whether `source` has
+        any extractable text (the same `_MIN_TEXT_CHARS` gate `pdf_a_word`
+        uses) — a scanned/image-only PDF is rejected with
+        `PDFSinTextoError` before `pdfplumber` ever runs. This is distinct
+        from a text-bearing PDF with zero detectable tables
+        (`PDFSinTablasError`), which never suggests OCR.
+
+        Writes ONE worksheet per detected table, in document order, named
+        `Tabla1`, `Tabla2`, etc. Non-tabular text (paragraphs, titles) never
+        appears in `output`.
+
+        Builds the workbook into a TEMP file first, then moves it to
+        `output` only on success (true validate-then-write), matching
+        `pdf_a_word`'s guarantee: a pre-existing file at `output` is never
+        touched on any failure path.
+
+        Raises:
+            EntradaInvalidaError: `source` is not a `.pdf`, is missing/
+                empty, or `output`'s parent directory (or a temp file near
+                it) cannot be created.
+            PDFCorruptoError: `source` cannot be opened/parsed by `pymupdf`.
+            PDFSinTextoError: `source` has no extractable text on any page
+                (likely scanned/image-only). Message suggests running OCR
+                PDF first. `pdfplumber` is never invoked for this input.
+            PDFSinTablasError: `source` has extractable text but no
+                detectable tables on any page. Does not suggest OCR, and
+                no `output` file is produced.
+            ConversionFallidaError: `pdfplumber` extraction or `openpyxl`
+                writing fails on an otherwise-valid, table-containing
+                `source`. `output` is left untouched — including if it
+                already existed before this call.
+        """
+        self._log.info("export start: %s", source.name)
+
+        self._require_nonempty_pdf(source)
+        self._make_output_dir(output.parent)
+
+        with self._translate_pdf_open_errors(source):
+            doc = pymupdf.open(source)
+            try:
+                text_chars = sum(len("".join(page.get_text().split())) for page in doc)
+            finally:
+                doc.close()
+
+        if text_chars < _MIN_TEXT_CHARS:
+            self._log.warning("export failed: no extractable text (%s)", source.name)
+            raise PDFSinTextoError(
+                f"{source.name!r} has no extractable text; run OCR PDF first."
+            )
+
+        with (
+            self._translate_table_extraction_errors(source),
+            pdfplumber.open(str(source)) as pdf,
+        ):
+            tables = [
+                table for page in pdf.pages for table in (page.extract_tables() or [])
+            ]
+
+        if not tables:
+            self._log.warning("export failed: no detectable tables (%s)", source.name)
+            raise PDFSinTablasError(f"{source.name!r} has no detectable tables.")
+
+        try:
+            fd, tmp_name = tempfile.mkstemp(suffix=".xlsx", dir=output.parent)
+            os.close(fd)
+        except OSError as exc:
+            self._log.warning("export failed: cannot create temp file (%s)", source.name)
+            raise EntradaInvalidaError(
+                f"Cannot create a temporary file near {output.name!r}."
+            ) from exc
+
+        tmp_path = Path(tmp_name)
+        try:
+            with self._translate_table_extraction_errors(source):
+                workbook = openpyxl.Workbook()
+                for index, table in enumerate(tables, start=1):
+                    if index == 1:
+                        sheet = workbook.active
+                        sheet.title = "Tabla1"
+                    else:
+                        sheet = workbook.create_sheet(title=f"Tabla{index}")
+                    for row in table:
+                        sheet.append(row)
+                workbook.save(tmp_path)
+            try:
+                os.replace(tmp_path, output)
+            except OSError as exc:
+                self._log.warning("export failed: cannot finalize output (%s)", source.name)
+                raise ConversionFallidaError(
+                    f"Table extraction/export for {source.name!r} failed."
+                ) from exc
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
         self._log.info("export ok: %s -> %s", source.name, output.name)
         return output

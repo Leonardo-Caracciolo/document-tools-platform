@@ -22,6 +22,7 @@ from tests.fixtures.pdf_factory import (
     make_image_heavy_pdf,
     make_jpg,
     make_native_text_pdf,
+    make_table_pdf,
     make_valid_pdf,
 )
 
@@ -126,5 +127,19 @@ def native_text_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
         name: str = "native_text.pdf", text: str = "Documento con texto nativo de prueba."
     ) -> Path:
         return make_native_text_pdf(tmp_path / name, text)
+
+    return _make
+
+
+@pytest.fixture
+def table_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes a ruled-grid table PDF (one table/page) under `tmp_path`."""
+
+    def _make(
+        name: str = "tables.pdf",
+        tables: list[list[list[str]]] | None = None,
+    ) -> Path:
+        default_tables = [[["Header1", "Header2"], ["A1", "B1"], ["A2", "B2"]]]
+        return make_table_pdf(tmp_path / name, tables if tables is not None else default_tables)
 
     return _make

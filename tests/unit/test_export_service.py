@@ -13,6 +13,8 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
+import openpyxl
+import pdfplumber
 import pymupdf
 import pytest
 from docx import Document
@@ -22,6 +24,7 @@ from app.core.exceptions import (
     ConversorNoDisponibleError,
     EntradaInvalidaError,
     PDFCorruptoError,
+    PDFSinTablasError,
     PDFSinTextoError,
 )
 from app.core.providers.azure_doc_converter_provider import AzureDocConverterProvider
@@ -659,6 +662,261 @@ class TestPdfAWordConversionFailure:
 
         with pytest.raises(ConversionFallidaError):
             service.pdf_a_word(source, output)
+
+        assert output.exists()
+        assert output.read_bytes() == original_bytes
+
+
+class TestPdfAExcelHappyPath:
+    """`ExportService.pdf_a_excel` — `.pdf` -> `.xlsx`, per `sdd/pdf-to-excel`."""
+
+    def test_multi_table_produces_multiple_worksheets(
+        self,
+        tmp_path: Path,
+        table_pdf_factory: Callable[..., Path],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        tables = [
+            [["Header1", "Header2"], ["A1", "B1"], ["A2", "B2"]],
+            [["X", "Y", "Z"], ["1", "2", "3"]],
+        ]
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = table_pdf_factory("tables.pdf", tables)
+        output = tmp_path / "out.xlsx"
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+            result = service.pdf_a_excel(source, output)
+
+        assert result == output
+        assert output.exists()
+        workbook = openpyxl.load_workbook(output)
+        assert workbook.sheetnames == ["Tabla1", "Tabla2"]
+        sheet1_rows = [list(row) for row in workbook["Tabla1"].iter_rows(values_only=True)]
+        sheet2_rows = [list(row) for row in workbook["Tabla2"].iter_rows(values_only=True)]
+        assert sheet1_rows == tables[0]
+        assert sheet2_rows == tables[1]
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any("start" in r.getMessage() for r in info_records)
+        assert any("ok" in r.getMessage() for r in info_records)
+        for record in info_records:
+            assert str(tmp_path) not in record.getMessage()
+
+
+class TestPdfAExcelValidation:
+    def test_rejects_non_pdf_extension_before_processing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = tmp_path / "not_a_pdf.txt"
+        source.write_text("hello")
+        output = tmp_path / "out.xlsx"
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME), pytest.raises(
+            EntradaInvalidaError
+        ):
+            service.pdf_a_excel(source, output)
+
+        assert not output.exists()
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1
+        assert "not_a_pdf.txt" in warning_records[0].getMessage()
+        assert str(tmp_path) not in warning_records[0].getMessage()
+
+    def test_rejects_missing_source(self, tmp_path: Path) -> None:
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = tmp_path / "missing.pdf"
+        output = tmp_path / "out.xlsx"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.pdf_a_excel(source, output)
+
+        assert not output.exists()
+
+    def test_rejects_empty_source(self, tmp_path: Path) -> None:
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = tmp_path / "empty.pdf"
+        source.write_bytes(b"")
+        output = tmp_path / "out.xlsx"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.pdf_a_excel(source, output)
+
+        assert not output.exists()
+
+    def test_rejects_uncreatable_output_dir(
+        self, tmp_path: Path, table_pdf_factory: Callable[..., Path]
+    ) -> None:
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = table_pdf_factory("tables.pdf")
+        blocked_by_file = tmp_path / "blocked_by_file"
+        blocked_by_file.write_bytes(b"not a directory")
+        output = blocked_by_file / "sub" / "out.xlsx"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.pdf_a_excel(source, output)
+
+        assert not output.exists()
+
+
+class TestPdfAExcelZeroTableRejection:
+    """`PDFSinTablasError` — distinct from `PDFSinTextoError`, no OCR suggestion."""
+
+    def test_rejects_prose_pdf_before_workbook_is_ever_constructed(
+        self,
+        tmp_path: Path,
+        native_text_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        calls: list[str] = []
+
+        class _SpyWorkbook:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                calls.append("constructed")
+
+        monkeypatch.setattr(openpyxl, "Workbook", _SpyWorkbook)
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = native_text_pdf_factory(
+            "prose.pdf", "Just a plain paragraph of prose, no grid or table at all."
+        )
+        output = tmp_path / "out.xlsx"
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME), pytest.raises(
+            PDFSinTablasError
+        ) as exc_info:
+            service.pdf_a_excel(source, output)
+
+        assert type(exc_info.value) is PDFSinTablasError
+        assert "OCR" not in str(exc_info.value)
+        assert calls == []
+        assert not output.exists()
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1
+        assert "prose.pdf" in warning_records[0].getMessage()
+        assert str(tmp_path) not in warning_records[0].getMessage()
+
+
+class TestPdfAExcelScannedRejection:
+    """A scanned/image-only PDF must raise `PDFSinTextoError`, NOT
+    `PDFSinTablasError` — proves the text-gate routes before `pdfplumber`
+    ever runs (mirrors `pdf_a_word`'s scanned-rejection precedent)."""
+
+    def test_rejects_image_only_pdf_before_pdfplumber_is_ever_invoked(
+        self,
+        tmp_path: Path,
+        image_only_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        calls: list[str] = []
+
+        def _raise_if_called(*args: object, **kwargs: object) -> None:
+            calls.append("opened")
+            raise AssertionError("pdfplumber.open must not be called on a scanned PDF")
+
+        monkeypatch.setattr(pdfplumber, "open", _raise_if_called)
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = image_only_pdf_factory("scanned.pdf")
+        output = tmp_path / "out.xlsx"
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME), pytest.raises(
+            PDFSinTextoError
+        ) as exc_info:
+            service.pdf_a_excel(source, output)
+
+        assert type(exc_info.value) is PDFSinTextoError
+        assert "OCR" in str(exc_info.value)
+        assert calls == []
+        assert not output.exists()
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1
+        assert "scanned.pdf" in warning_records[0].getMessage()
+        assert str(tmp_path) not in warning_records[0].getMessage()
+
+
+class TestPdfAExcelCorruptPdf:
+    def test_rejects_corrupt_pdf_at_open_time(
+        self,
+        tmp_path: Path,
+        corrupt_pdf_factory: Callable[..., Path],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = corrupt_pdf_factory("corrupt.pdf")
+        output = tmp_path / "out.xlsx"
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME), pytest.raises(
+            PDFCorruptoError
+        ) as exc_info:
+            service.pdf_a_excel(source, output)
+
+        assert type(exc_info.value) is PDFCorruptoError
+        assert not output.exists()
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("corrupt.pdf" in r.getMessage() for r in warning_records)
+        for record in warning_records:
+            assert str(tmp_path) not in record.getMessage()
+
+
+class TestPdfAExcelExtractionFailure:
+    def test_openpyxl_save_failure_raises_conversion_fallida_no_output(
+        self,
+        tmp_path: Path,
+        table_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No natural way to make `openpyxl` fail on an otherwise-valid
+        table PDF, so `Workbook.save` is monkeypatched to raise — matching
+        `pdf_a_word`'s established precedent for hard-to-trigger real
+        failures."""
+
+        def _raise_save(self: object, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("simulated openpyxl save failure")
+
+        monkeypatch.setattr(openpyxl.Workbook, "save", _raise_save)
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = table_pdf_factory("tables.pdf")
+        output = tmp_path / "out.xlsx"
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME), pytest.raises(
+            ConversionFallidaError
+        ) as exc_info:
+            service.pdf_a_excel(source, output)
+
+        assert type(exc_info.value) is ConversionFallidaError
+        assert not output.exists()
+        # Regression: the temp `.xlsx` must be cleaned up, not left orphaned.
+        assert list(tmp_path.glob("*.xlsx")) == []
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("tables.pdf" in r.getMessage() for r in warning_records)
+        for record in warning_records:
+            assert str(tmp_path) not in record.getMessage()
+
+    def test_preexisting_output_file_survives_an_extraction_failure_untouched(
+        self,
+        tmp_path: Path,
+        table_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mandatory validate-then-write regression, mirroring
+        `pdf_a_word`'s CRITICAL-bug-fix test: a pre-existing `output` must
+        never be deleted or overwritten on any failure path, because the
+        workbook is built into a temp file first and only moved to
+        `output` via `os.replace()` on success."""
+
+        def _raise_save(self: object, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("simulated openpyxl save failure")
+
+        monkeypatch.setattr(openpyxl.Workbook, "save", _raise_save)
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = table_pdf_factory("tables.pdf")
+        output = tmp_path / "out.xlsx"
+        original_bytes = b"a pre-existing xlsx the caller does not want deleted"
+        output.write_bytes(original_bytes)
+
+        with pytest.raises(ConversionFallidaError):
+            service.pdf_a_excel(source, output)
 
         assert output.exists()
         assert output.read_bytes() == original_bytes
