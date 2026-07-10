@@ -1,13 +1,14 @@
-"""Tests for `app.core.services.pdf_service` (PR1 foundation only).
+"""Tests for `app.core.services.pdf_service`.
 
-Operation methods (merge/split/organize/protect/unlock/jpg_to_pdf) are
-implemented in later Sprint 1 PRs and have no tests here yet. This
-module covers only the constructor, `_translate_errors` mapping, and
-`_validate_pages` helper scaffolded in PR1.
+Covers the PR1 foundation (constructor, `_translate_errors` mapping,
+`_validate_pages` helper) plus the PR2 `merge`/`split` operations.
+`organize`/`protect`/`unlock`/`jpg_to_pdf` are implemented in later
+Sprint 1 PRs and have no tests here yet.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import img2pdf
@@ -139,3 +140,135 @@ def test_translate_errors_maps_img2pdf_image_open_error_to_entrada_invalida() ->
         service._translate_errors("jpg_to_pdf", Path("broken.jpg")),
     ):
         raise img2pdf.ImageOpenError("cannot open image")
+
+
+class TestMerge:
+    """Tests for `PDFService.merge`."""
+
+    def test_merge_two_valid_pdfs_preserves_page_order(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        first = valid_pdf_factory("first.pdf", pages=2)
+        second = valid_pdf_factory("second.pdf", pages=3)
+        service = PDFService()
+        output = tmp_path / "merged.pdf"
+
+        result = service.merge([first, second], output)
+
+        assert result == output
+        with pikepdf.Pdf.open(output) as merged:
+            assert len(merged.pages) == 5
+
+    def test_merge_single_file_is_a_content_passthrough(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("only.pdf", pages=2)
+        service = PDFService()
+        output = tmp_path / "merged.pdf"
+
+        service.merge([source], output)
+
+        with pikepdf.Pdf.open(output) as merged:
+            assert len(merged.pages) == 2
+
+    def test_merge_raises_entrada_invalida_for_zero_files(self, tmp_path: Path) -> None:
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.merge([], tmp_path / "merged.pdf")
+
+    def test_merge_raises_entrada_invalida_for_empty_input_file(
+        self,
+        tmp_path: Path,
+        valid_pdf_factory: Callable[..., Path],
+        empty_file_factory: Callable[..., Path],
+    ) -> None:
+        good = valid_pdf_factory("good.pdf")
+        empty = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.merge([good, empty], tmp_path / "merged.pdf")
+
+    def test_merge_raises_pdf_corrupto_naming_offending_file(
+        self,
+        tmp_path: Path,
+        valid_pdf_factory: Callable[..., Path],
+        corrupt_pdf_factory: Callable[..., Path],
+    ) -> None:
+        good = valid_pdf_factory("good.pdf")
+        bad = corrupt_pdf_factory("bad.pdf")
+        service = PDFService()
+
+        with pytest.raises(PDFCorruptoError, match="bad.pdf"):
+            service.merge([good, bad], tmp_path / "merged.pdf")
+
+
+class TestSplit:
+    """Tests for `PDFService.split`."""
+
+    def test_split_creates_one_file_per_range(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=5)
+        service = PDFService()
+
+        outputs = service.split(source, tmp_path / "out", ranges=[(1, 2), (3, 5)])
+
+        assert len(outputs) == 2
+        with pikepdf.Pdf.open(outputs[0]) as first:
+            assert len(first.pages) == 2
+        with pikepdf.Pdf.open(outputs[1]) as second:
+            assert len(second.pages) == 3
+
+    def test_split_defaults_to_one_file_per_page(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+
+        outputs = service.split(source, tmp_path / "out")
+
+        assert len(outputs) == 3
+        for output in outputs:
+            with pikepdf.Pdf.open(output) as chunk:
+                assert len(chunk.pages) == 1
+
+    def test_split_raises_entrada_invalida_for_out_of_range_page(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=3)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="5"):
+            service.split(source, tmp_path / "out", ranges=[(1, 5)])
+
+    def test_split_single_page_pdf_produces_one_output_equal_to_source(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        outputs = service.split(source, tmp_path / "out", ranges=[(1, 1)])
+
+        assert len(outputs) == 1
+        with pikepdf.Pdf.open(outputs[0]) as chunk:
+            assert len(chunk.pages) == 1
+
+    def test_split_raises_entrada_invalida_for_zero_page_pdf(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("empty.pdf", pages=0)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.split(source, tmp_path / "out")
+
+    def test_split_raises_entrada_invalida_for_empty_source_file(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.split(source, tmp_path / "out")

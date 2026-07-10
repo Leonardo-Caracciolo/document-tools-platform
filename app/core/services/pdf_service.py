@@ -10,12 +10,10 @@ at a single, scoped boundary (`_translate_errors`) so no raw
 Stateless and thread-safe: no config injection, no internal
 `TaskRunner.submit()` calls — a future UI composes
 `runner.submit(service.merge, ...)` instead of the service wrapping
-itself (see SSD §5.2). Operation methods (merge/split/organize/protect/
-unlock/jpg_to_pdf) land in later Sprint 1 PRs; this module only
-scaffolds the constructor, the exception-translation boundary, and the
-shared empty-file/page-validation helpers. Every operation MUST call
-`_require_nonempty_file` before opening its input(s) with `pikepdf`/
-Pillow — see that method's docstring for why.
+itself (see SSD §5.2). `organize`/`protect`/`unlock`/`jpg_to_pdf` land in
+later Sprint 1 PRs. Every operation MUST call `_require_nonempty_file`
+before opening its input(s) with `pikepdf`/Pillow — see that method's
+docstring for why.
 """
 
 from __future__ import annotations
@@ -119,3 +117,93 @@ class PDFService:
                 raise EntradaInvalidaError(
                     f"Page {page} is out of range for {source.name!r} ({page_count} page(s))."
                 )
+
+    def _make_output_dir(self, directory: Path) -> None:
+        """Create `directory` (and parents) if needed, or raise `EntradaInvalidaError`."""
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise EntradaInvalidaError(
+                f"Cannot create output directory {directory.name!r}."
+            ) from exc
+
+    def merge(self, inputs: Sequence[Path], output: Path) -> Path:
+        """Merge `inputs` into one PDF at `output`, preserving page order.
+
+        A single input is a valid case: `output` then contains exactly
+        that input's pages (a content passthrough — no special-cased
+        code path is needed since the merge loop handles it uniformly).
+
+        Raises:
+            `EntradaInvalidaError`: `inputs` is empty, any input is
+                missing/0 bytes (`_require_nonempty_file`), or `output`'s
+                parent directory cannot be created.
+            `PDFCorruptoError`: any input fails to parse.
+        """
+        if not inputs:
+            raise EntradaInvalidaError("No input files provided for merge.")
+
+        self._log.info("merge start: %d input(s)", len(inputs))
+        self._make_output_dir(output.parent)
+
+        merged = pikepdf.Pdf.new()
+        for source in inputs:
+            self._require_nonempty_file(source)
+            with self._translate_errors("merge", source), pikepdf.Pdf.open(source) as pdf:
+                merged.pages.extend(pdf.pages)
+
+        merged.save(output)
+        self._log.info("merge ok: %d page(s) -> %s", len(merged.pages), output.name)
+        return output
+
+    def split(
+        self,
+        source: Path,
+        output_dir: Path,
+        ranges: Sequence[tuple[int, int]] | None = None,
+    ) -> list[Path]:
+        """Split `source` into one output file per entry in `ranges`.
+
+        `ranges` entries are 1-based, inclusive page ranges (`(start,
+        end)`). `None` (default) produces one output file per page.
+        Validation (`_validate_pages`) runs after `source` is opened
+        (page count is only known then) but is a separate domain-error
+        path from `_translate_errors` — `EntradaInvalidaError` is never
+        one of the exception types `_translate_errors` maps, so raising
+        it from inside that context still propagates unwrapped.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, `source`
+                has no pages, any range references an out-of-range page
+                or has `start > end`, or `output_dir` cannot be created.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source)
+        self._log.info("split start: %s", source.name)
+        self._make_output_dir(output_dir)
+
+        outputs: list[Path] = []
+        with self._translate_errors("split", source), pikepdf.Pdf.open(source) as pdf:
+            page_count = len(pdf.pages)
+            if ranges is not None:
+                resolved_ranges = ranges
+            else:
+                resolved_ranges = [(page, page) for page in range(1, page_count + 1)]
+
+            pages_to_validate = [page for start, end in resolved_ranges for page in (start, end)]
+            self._validate_pages(pages_to_validate, page_count, source)
+
+            for start, end in resolved_ranges:
+                if start > end:
+                    raise EntradaInvalidaError(
+                        f"Invalid range ({start}, {end}) for {source.name!r}."
+                    )
+                chunk = pikepdf.Pdf.new()
+                chunk.pages.extend(pdf.pages[start - 1 : end])
+                suffix = f"page_{start}" if start == end else f"pages_{start}-{end}"
+                output_path = output_dir / f"{source.stem}_{suffix}.pdf"
+                chunk.save(output_path)
+                outputs.append(output_path)
+
+        self._log.info("split ok: %d output(s) -> %s", len(outputs), output_dir.name)
+        return outputs
