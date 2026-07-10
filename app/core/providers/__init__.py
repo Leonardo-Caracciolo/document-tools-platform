@@ -1,4 +1,6 @@
-"""OCR / document-converter provider package (placement only).
+"""OCR / document-converter provider package.
 
-No provider logic is implemented in Sprint 0.
+Holds the `DocumentConverterProvider` Protocol and its concrete
+implementations (`ComWordProvider`, `AzureDocConverterProvider`), consumed
+by `app.core.services.export_service.ExportService`.
 """

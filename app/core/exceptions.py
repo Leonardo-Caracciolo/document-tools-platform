@@ -8,6 +8,10 @@ startup instead of continuing with an undefined value.
 `EntradaInvalidaError` are raised by `app.core.services.pdf_service` so
 `pikepdf`/`img2pdf`/`Pillow` failures never reach callers as raw
 tracebacks.
+
+`ConversorNoDisponibleError` and `ConversionFallidaError` are raised by
+`app.core.services.export_service` so `docx2pdf`/COM/`pywin32` failures
+never reach callers as raw tracebacks.
 """
 
 from __future__ import annotations
@@ -31,3 +35,11 @@ class ContrasenaInvalidaError(Exception):
 
 class EntradaInvalidaError(Exception):
     """Raised when caller-supplied input (paths, pages, images) is invalid."""
+
+
+class ConversorNoDisponibleError(Exception):
+    """Raised when the active document converter provider is unavailable."""
+
+
+class ConversionFallidaError(Exception):
+    """Raised when a document conversion fails or exceeds its timeout."""
