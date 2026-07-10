@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from tests.fixtures.pdf_factory import (
+    make_corrupt_jpg,
     make_corrupt_pdf,
     make_empty_file,
     make_encrypted_pdf,
@@ -68,5 +69,15 @@ def jpg_factory(tmp_path: Path) -> Callable[..., Path]:
 
     def _make(name: str = "image.jpg") -> Path:
         return make_jpg(tmp_path / name)
+
+    return _make
+
+
+@pytest.fixture
+def corrupt_jpg_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes a non-image `.jpg` file under `tmp_path`."""
+
+    def _make(name: str = "corrupt.jpg") -> Path:
+        return make_corrupt_jpg(tmp_path / name)
 
     return _make

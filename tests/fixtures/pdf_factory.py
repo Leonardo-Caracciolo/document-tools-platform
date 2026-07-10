@@ -47,3 +47,13 @@ def make_jpg(path: Path) -> Path:
     """Write a valid, minimal JPEG image to `path`."""
     Image.new("RGB", (64, 64), "white").save(path, "JPEG")
     return path
+
+
+def make_corrupt_jpg(path: Path) -> Path:
+    """Write a non-image file (plain bytes, `.jpg` extension) to `path`.
+
+    Pillow's `Image.open()` raises `UnidentifiedImageError` for this —
+    it never gets far enough to reach `Image.verify()`.
+    """
+    path.write_bytes(b"this is not an image, just plain garbage bytes")
+    return path

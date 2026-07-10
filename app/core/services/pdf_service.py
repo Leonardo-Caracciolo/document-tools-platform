@@ -10,9 +10,9 @@ at a single, scoped boundary (`_translate_errors`) so no raw
 Stateless and thread-safe: no config injection, no internal
 `TaskRunner.submit()` calls — a future UI composes
 `runner.submit(service.merge, ...)` instead of the service wrapping
-itself (see SSD §5.2). `jpg_to_pdf` lands in a later Sprint 1 PR. Every
-operation MUST call `_require_nonempty_file` before opening its
-input(s) with `pikepdf`/Pillow — see that method's docstring for why.
+itself (see SSD §5.2). Every operation MUST call
+`_require_nonempty_file` before opening its input(s) with
+`pikepdf`/Pillow — see that method's docstring for why.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Literal
 
 import img2pdf
 import pikepdf
-from PIL import UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 
 from app.core.exceptions import (
     ArchivoProtegidoError,
@@ -333,4 +333,41 @@ class PDFService:
             pdf.save(output)
 
         self._log.info("unlock ok: %s -> %s", source.name, output.name)
+        return output
+
+    def jpg_to_pdf(self, images: Sequence[Path], output: Path) -> Path:
+        """Convert `images` into one PDF at `output`, one page per image, in order.
+
+        Every image is verified with Pillow's `Image.verify()` BEFORE
+        `img2pdf.convert()` is called — same validate-then-write
+        convention as the other five operations: a corrupt image late
+        in `images` must not leave a partial output file or an orphaned
+        output directory behind. `Image.verify()` only checks the file
+        header/structure and cannot be reused afterward, but that's
+        fine here since this pass exists purely to validate, not to
+        decode pixel data for later use.
+
+        Raises:
+            `EntradaInvalidaError`: `images` is empty, any image is
+                missing/0 bytes (`_require_nonempty_file`), any image
+                is not a valid/decodable image, or `output`'s parent
+                directory cannot be created.
+        """
+        if not images:
+            raise EntradaInvalidaError("No input images provided for jpg_to_pdf.")
+
+        self._log.info("jpg_to_pdf start: %d image(s)", len(images))
+
+        for image in images:
+            self._require_nonempty_file(image)
+            with self._translate_errors("jpg_to_pdf", image), Image.open(image) as img:
+                img.verify()
+
+        # All images validated: safe to create the output dir and write.
+        self._make_output_dir(output.parent)
+        with self._translate_errors("jpg_to_pdf", images[0]):
+            pdf_bytes = img2pdf.convert([str(image) for image in images])
+        output.write_bytes(pdf_bytes)
+
+        self._log.info("jpg_to_pdf ok: %d image(s) -> %s", len(images), output.name)
         return output

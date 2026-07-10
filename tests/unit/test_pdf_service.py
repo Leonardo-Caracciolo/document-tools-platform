@@ -1,13 +1,15 @@
 """Tests for `app.core.services.pdf_service`.
 
 Covers the PR1 foundation (constructor, `_translate_errors` mapping,
-`_validate_pages` helper), the PR2 `merge`/`split` operations, and the
-PR3 `organize`/`protect`/`unlock` operations. `jpg_to_pdf` is
-implemented in a later Sprint 1 PR and has no tests here yet.
+`_validate_pages` helper), the PR2 `merge`/`split` operations, the PR3
+`organize`/`protect`/`unlock` operations, and the PR4 `jpg_to_pdf`
+operation plus cross-cutting logging/exception-containment tests
+exercised across all six operations.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -522,3 +524,216 @@ class TestUnlock:
             service.unlock(source, output, password="whatever")
 
         assert not output.parent.exists()
+
+
+class TestJpgToPdf:
+    """Tests for `PDFService.jpg_to_pdf`."""
+
+    def test_jpg_to_pdf_converts_multiple_images_to_one_pdf_in_order(
+        self, tmp_path: Path, jpg_factory: Callable[..., Path]
+    ) -> None:
+        first = jpg_factory("first.jpg")
+        second = jpg_factory("second.jpg")
+        third = jpg_factory("third.jpg")
+        service = PDFService()
+        output = tmp_path / "images.pdf"
+
+        result = service.jpg_to_pdf([first, second, third], output)
+
+        assert result == output
+        with pikepdf.Pdf.open(output) as pdf:
+            assert len(pdf.pages) == 3
+
+    def test_jpg_to_pdf_single_image_produces_one_page_pdf(
+        self, tmp_path: Path, jpg_factory: Callable[..., Path]
+    ) -> None:
+        image = jpg_factory("only.jpg")
+        service = PDFService()
+        output = tmp_path / "images.pdf"
+
+        service.jpg_to_pdf([image], output)
+
+        with pikepdf.Pdf.open(output) as pdf:
+            assert len(pdf.pages) == 1
+
+    def test_jpg_to_pdf_raises_entrada_invalida_for_zero_images(self, tmp_path: Path) -> None:
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.jpg_to_pdf([], tmp_path / "images.pdf")
+
+    def test_jpg_to_pdf_raises_entrada_invalida_naming_offending_file(
+        self,
+        tmp_path: Path,
+        jpg_factory: Callable[..., Path],
+        corrupt_jpg_factory: Callable[..., Path],
+    ) -> None:
+        good = jpg_factory("good.jpg")
+        bad = corrupt_jpg_factory("bad.jpg")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="bad.jpg"):
+            service.jpg_to_pdf([good, bad], tmp_path / "images.pdf")
+
+    def test_jpg_to_pdf_raises_entrada_invalida_for_empty_image_file(
+        self,
+        tmp_path: Path,
+        jpg_factory: Callable[..., Path],
+        empty_file_factory: Callable[..., Path],
+    ) -> None:
+        good = jpg_factory("good.jpg")
+        empty = empty_file_factory("empty.jpg")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.jpg_to_pdf([good, empty], tmp_path / "images.pdf")
+
+    def test_jpg_to_pdf_rejects_later_corrupt_image_without_orphaning_output_dir(
+        self,
+        tmp_path: Path,
+        jpg_factory: Callable[..., Path],
+        corrupt_jpg_factory: Callable[..., Path],
+    ) -> None:
+        """Regression: `jpg_to_pdf` must Pillow-`verify()` every image
+        BEFORE `_make_output_dir`/`img2pdf.convert()` — otherwise a
+        corrupt image late in `images` (after earlier valid ones were
+        already checked) would leave an orphaned output directory."""
+        first = jpg_factory("first.jpg")
+        second = jpg_factory("second.jpg")
+        bad = corrupt_jpg_factory("bad.jpg")
+        service = PDFService()
+        output = tmp_path / "out" / "images.pdf"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.jpg_to_pdf([first, second, bad], output)
+
+        assert not output.parent.exists()
+
+
+class TestCrossCuttingLoggingAndExceptionContainment:
+    """Cross-cutting tests (4.3/4.4) exercised across all six operations.
+
+    Verifies every operation logs INFO on success and WARNING on
+    failure via the Sprint 0 `get_logger` (filename-only messages, no
+    absolute paths, no passwords), and that no raw
+    `pikepdf`/`img2pdf`/`Pillow` exception ever surfaces to a caller —
+    only the four domain exceptions do.
+    """
+
+    _RAW_LIBRARY_EXCEPTIONS = (
+        pikepdf.PdfError,
+        pikepdf.PasswordError,
+        UnidentifiedImageError,
+        OSError,
+        img2pdf.ImageOpenError,
+        img2pdf.AlphaChannelError,
+    )
+
+    def test_all_six_ops_log_info_on_success(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        valid_pdf_factory: Callable[..., Path],
+        encrypted_pdf_factory: Callable[..., Path],
+        jpg_factory: Callable[..., Path],
+    ) -> None:
+        service = PDFService()
+        good = valid_pdf_factory("good.pdf", pages=2)
+        encrypted = encrypted_pdf_factory("locked.pdf", owner="owner-pwd", user="user-pwd")
+        image = jpg_factory("image.jpg")
+
+        success_calls: dict[str, Callable[[], object]] = {
+            "merge": lambda: service.merge([good], tmp_path / "merge_ok.pdf"),
+            "split": lambda: service.split(good, tmp_path / "split_ok"),
+            "organize": lambda: service.organize(good, tmp_path / "organize_ok.pdf", order=[1]),
+            "protect": lambda: service.protect(
+                good, tmp_path / "protect_ok.pdf", owner_password="secret"
+            ),
+            "unlock": lambda: service.unlock(
+                encrypted, tmp_path / "unlock_ok.pdf", password="user-pwd"
+            ),
+            "jpg_to_pdf": lambda: service.jpg_to_pdf([image], tmp_path / "jpg_ok.pdf"),
+        }
+
+        with caplog.at_level(logging.INFO, logger="app.core.services.pdf_service"):
+            for op_name, call in success_calls.items():
+                caplog.clear()
+                call()
+
+                info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+                assert info_records, f"{op_name} logged no INFO record on success"
+                assert any("ok" in r.getMessage() for r in info_records), (
+                    f"{op_name} INFO log missing an 'ok' success marker"
+                )
+                for record in info_records:
+                    message = record.getMessage()
+                    assert str(tmp_path) not in message, (
+                        f"{op_name} INFO log leaked an absolute path"
+                    )
+                    assert "secret" not in message, f"{op_name} INFO log leaked a password"
+
+    def test_all_six_ops_log_warning_and_raise_only_domain_exceptions_on_failure(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        encrypted_pdf_factory: Callable[..., Path],
+        corrupt_pdf_factory: Callable[..., Path],
+        corrupt_jpg_factory: Callable[..., Path],
+    ) -> None:
+        service = PDFService()
+        encrypted = encrypted_pdf_factory("locked.pdf", owner="owner-pwd", user="user-pwd")
+        corrupt = corrupt_pdf_factory("corrupt.pdf")
+        corrupt_image = corrupt_jpg_factory("corrupt.jpg")
+
+        failure_calls: dict[str, tuple[Callable[[], object], type[Exception]]] = {
+            "merge": (
+                lambda: service.merge([corrupt], tmp_path / "merge_bad.pdf"),
+                PDFCorruptoError,
+            ),
+            "split": (
+                lambda: service.split(corrupt, tmp_path / "split_bad"),
+                PDFCorruptoError,
+            ),
+            "organize": (
+                lambda: service.organize(corrupt, tmp_path / "organize_bad.pdf", order=[1]),
+                PDFCorruptoError,
+            ),
+            "protect": (
+                lambda: service.protect(
+                    encrypted, tmp_path / "protect_bad.pdf", owner_password="secret"
+                ),
+                ArchivoProtegidoError,
+            ),
+            "unlock": (
+                lambda: service.unlock(
+                    encrypted, tmp_path / "unlock_bad.pdf", password="not-the-password"
+                ),
+                ContrasenaInvalidaError,
+            ),
+            "jpg_to_pdf": (
+                lambda: service.jpg_to_pdf([corrupt_image], tmp_path / "jpg_bad.pdf"),
+                EntradaInvalidaError,
+            ),
+        }
+
+        with caplog.at_level(logging.WARNING, logger="app.core.services.pdf_service"):
+            for op_name, (call, expected_exc) in failure_calls.items():
+                caplog.clear()
+                with pytest.raises(expected_exc) as exc_info:
+                    call()
+
+                assert not isinstance(exc_info.value, self._RAW_LIBRARY_EXCEPTIONS), (
+                    f"{op_name} let a raw library exception surface as {type(exc_info.value)!r}"
+                )
+
+                warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+                assert warning_records, f"{op_name} logged no WARNING record on failure"
+                for record in warning_records:
+                    message = record.getMessage()
+                    assert str(tmp_path) not in message, (
+                        f"{op_name} WARNING log leaked an absolute path"
+                    )
+                    assert "secret" not in message, f"{op_name} WARNING log leaked a password"
+                    assert "not-the-password" not in message, (
+                        f"{op_name} WARNING log leaked a password"
+                    )
