@@ -6,11 +6,12 @@ Testability" requirement) — no real photographed image, no CI flakiness
 tied to photo quality.
 
 Both a NEGATIVE and a POSITIVE rotation angle are required (not
-optional): the naive `if angle < -45: angle += 90` normalization —
-tried and rejected during design — happened to produce a correct crop
-for positive angles by coincidence, masking a real width/height-swap
-defect for negative angles. A positive-only suite would not have caught
-that bug; see `sdd/scan-to-pdf/design`'s "Empirical status" (2).
+optional), including magnitudes past 45 degrees: the naive
+`if angle < -45: angle += 90` normalization — tried and rejected during
+design — fails symmetrically for large-magnitude angles of BOTH signs
+(roughly `|angle| > 45`), producing a width/height-swapped crop. A
+suite that only tested small angles, or only one sign, would not have
+caught that bug; see `sdd/scan-to-pdf/design`'s "Empirical status" (2).
 """
 
 from __future__ import annotations

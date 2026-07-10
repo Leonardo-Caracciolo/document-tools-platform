@@ -15,8 +15,9 @@ Confirmed empirically during design (`sdd/scan-to-pdf/design`,
 importantly — `cv2.minAreaRect`'s angle needs correcting with
 `norm_angle = angle + 90 if rw > rh else angle`, NOT the more commonly
 seen `if angle < -45: angle += 90`. The latter was implemented and
-tested during design and found WRONG for negative rotation angles (see
-`_normalize_angle`'s docstring before "simplifying" this back).
+tested during design and found WRONG for large-magnitude rotation
+angles of EITHER sign (see `_normalize_angle`'s docstring before
+"simplifying" this back).
 """
 
 from __future__ import annotations
@@ -70,15 +71,16 @@ def _normalize_angle(rect: tuple[tuple[float, float], tuple[float, float], float
 
     NOT the commonly-seen `if angle < -45: angle += 90`. That naive
     version was implemented and tested during design across 15 synthetic
-    rotation angles from -89 to +89 degrees: it worked for positive
-    angles only, and produced a width/height-swapped crop for every
-    negative angle tested — a real, reproducible defect caught before any
-    code shipped. The `rw > rh` formula compares the box's own measured
-    width/height rather than the angle's numeric range, so it is robust
-    regardless of which numeric convention the installed OpenCV version
-    uses for `minAreaRect`'s angle. Re-validated at a 100% match rate
-    (every recovered crop within 1px of the known original size) across
-    the same 15 angles.
+    rotation angles from -89 to +89 degrees: it failed symmetrically for
+    large-magnitude angles of BOTH signs (roughly `|angle| > 45`, e.g.
+    -89/-76/-63/-51 AND +51/+64/+76/+89 all produced width/height-swapped
+    crops), not "negative angles only" — a real, reproducible defect
+    caught before any code shipped. The `rw > rh` formula compares the
+    box's own measured width/height rather than the angle's numeric sign
+    or magnitude, so it is robust regardless of which numeric convention
+    the installed OpenCV version uses for `minAreaRect`'s angle.
+    Re-validated at a 100% match rate (every recovered crop within 1px of
+    the known original size) across the same 15 angles.
 
     Do not "simplify" this back to `angle < -45` — that was tried and is
     wrong.
