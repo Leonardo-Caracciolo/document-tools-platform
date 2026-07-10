@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,18 @@ _RECOGNITION_TIMEOUT_SECONDS = 60.0
 #: binary-autodetection fallback order.
 _TYPICAL_WINDOWS_INSTALL_PATH = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 
+#: Guards the read-then-write of `pytesseract.pytesseract.tesseract_cmd`
+#: inside `esta_disponible()`. That attribute is PROCESS-WIDE module state
+#: (not per-`TesseractOCRProvider`-instance) — `pytesseract` itself reads
+#: it by name inside `run_and_get_output` at call time. Concurrent
+#: `reconocer()` calls (this app routes long operations through a
+#: background `ThreadPoolExecutor`, SSD §5.2) all resolve to the same
+#: fixed path for the process lifetime, so today's concurrent writes are
+#: idempotent — but the lock documents the invariant explicitly rather
+#: than relying on that being true forever, matching the guard
+#: `ComWordProvider._CONVERSION_LOCK` applies to ITS own shared state.
+_TESSERACT_CMD_LOCK = threading.Lock()
+
 
 class TesseractOCRProvider:
     """`OCRProvider` implementation backed by a local Tesseract binary."""
@@ -61,25 +74,34 @@ class TesseractOCRProvider:
         2. `shutil.which("tesseract")` (binary on `PATH`).
         3. The typical Windows install path.
 
-        On success, also sets `pytesseract.pytesseract.tesseract_cmd` to
-        the resolved path so `reconocer` doesn't need to re-resolve it.
+        NOT a pure predicate despite the name/Protocol contract: on
+        success this also sets `pytesseract.pytesseract.tesseract_cmd`
+        (process-wide module state, not per-instance) to the resolved
+        path, guarded by `_TESSERACT_CMD_LOCK` — see that lock's
+        docstring for why this is safe today and what would make it not
+        be. `reconocer` relies on this side effect instead of
+        re-resolving the path itself.
         """
-        env_path = os.environ.get("TESSERACT_PATH")
-        if env_path and Path(env_path).is_file():
-            pytesseract.pytesseract.tesseract_cmd = env_path
-            return True, env_path
+        with _TESSERACT_CMD_LOCK:
+            env_path = os.environ.get("TESSERACT_PATH")
+            if env_path and Path(env_path).is_file():
+                pytesseract.pytesseract.tesseract_cmd = env_path
+                return True, env_path
 
-        which_path = shutil.which("tesseract")
-        if which_path:
-            pytesseract.pytesseract.tesseract_cmd = which_path
-            return True, which_path
+            which_path = shutil.which("tesseract")
+            if which_path:
+                pytesseract.pytesseract.tesseract_cmd = which_path
+                return True, which_path
 
-        if _TYPICAL_WINDOWS_INSTALL_PATH.is_file():
-            resolved = str(_TYPICAL_WINDOWS_INSTALL_PATH)
-            pytesseract.pytesseract.tesseract_cmd = resolved
-            return True, resolved
+            if _TYPICAL_WINDOWS_INSTALL_PATH.is_file():
+                resolved = str(_TYPICAL_WINDOWS_INSTALL_PATH)
+                pytesseract.pytesseract.tesseract_cmd = resolved
+                return True, resolved
 
-        return False, "tesseract binary not found (TESSERACT_PATH, PATH, or typical install path)."
+            return (
+                False,
+                "tesseract binary not found (TESSERACT_PATH, PATH, or typical install path).",
+            )
 
     def reconocer(self, image: Image.Image) -> list[RecognizedWord]:
         """Recognize Spanish text in `image` via `pytesseract.image_to_data`.

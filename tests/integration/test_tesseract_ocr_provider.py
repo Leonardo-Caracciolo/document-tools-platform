@@ -21,10 +21,6 @@ can't silently regress this assumption.
 
 from __future__ import annotations
 
-import csv
-import io
-import subprocess
-import time
 from pathlib import Path
 
 import pytesseract
@@ -32,6 +28,7 @@ import pytest
 from PIL import Image, ImageDraw, ImageFont
 
 from app.core.providers.tesseract_ocr_provider import TesseractOCRProvider
+from tests.integration._process_utils import assert_no_orphaned_process, running_pids_for_image
 
 _CANDIDATE_FONTS = (
     r"C:\Windows\Fonts\arial.ttf",
@@ -109,30 +106,6 @@ def _make_dense_image(size: tuple[int, int] = (4000, 5000)) -> Image.Image:
     return image
 
 
-def _running_tesseract_pids() -> set[int]:
-    """Return the PIDs of every currently-running `tesseract.exe` process.
-
-    Mirrors `tests/integration/test_com_word_provider.py`'s
-    `_running_word_pids` helper, gated on `tesseract.exe` instead of
-    `WINWORD.EXE`.
-    """
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq tesseract.exe", "/FO", "CSV", "/NH"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    pids: set[int] = set()
-    for row in csv.reader(io.StringIO(result.stdout)):
-        if len(row) < 2:
-            continue
-        try:
-            pids.add(int(row[1]))
-        except ValueError:
-            continue
-    return pids
-
-
 def test_reconocer_recognizes_real_spanish_text() -> None:
     provider = TesseractOCRProvider()
     image = _make_text_image("Factura Total")
@@ -168,19 +141,9 @@ def test_reconocer_timeout_does_not_leak_orphaned_tesseract_process(
     )
     image = _make_dense_image()
 
-    pids_before = _running_tesseract_pids()
+    pids_before = running_pids_for_image("tesseract.exe")
 
     with pytest.raises(RuntimeError):
         provider.reconocer(image)
 
-    # Give the OS a brief moment to finish tearing down any transient
-    # process before asserting — not necessarily instantaneous.
-    deadline = time.monotonic() + 10.0
-    orphaned = _running_tesseract_pids() - pids_before
-    while orphaned and time.monotonic() < deadline:
-        time.sleep(0.5)
-        orphaned = _running_tesseract_pids() - pids_before
-
-    assert not orphaned, (
-        f"Orphaned tesseract.exe process(es) left running after timeout: {orphaned}"
-    )
+    assert_no_orphaned_process("tesseract.exe", pids_before)

@@ -20,17 +20,14 @@ processes remain afterward.
 
 from __future__ import annotations
 
-import csv
-import io
 import platform
-import subprocess
-import time
 from pathlib import Path
 
 import pytest
 from docx import Document
 
 from app.core.providers.com_word_provider import ComWordProvider
+from tests.integration._process_utils import assert_no_orphaned_process, running_pids_for_image
 
 pytestmark = pytest.mark.skipif(
     platform.system() != "Windows", reason="ComWordProvider requires Windows + Word COM."
@@ -51,29 +48,6 @@ def _make_valid_docx(path: Path) -> Path:
     document.add_paragraph("ComWordProvider integration test content.")
     document.save(path)
     return path
-
-
-def _running_word_pids() -> set[int]:
-    """Return the PIDs of every currently-running `WINWORD.EXE` process.
-
-    Mirrors `ComWordProvider._snapshot_word_pids` so the regression test
-    observes the exact same signal the provider itself relies on.
-    """
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/FO", "CSV", "/NH"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    pids: set[int] = set()
-    for row in csv.reader(io.StringIO(result.stdout)):
-        if len(row) < 2:
-            continue
-        try:
-            pids.add(int(row[1]))
-        except ValueError:
-            continue
-    return pids
 
 
 def _skip_if_word_unavailable(provider: ComWordProvider) -> None:
@@ -116,20 +90,9 @@ def test_convertir_timeout_does_not_leak_orphaned_word_process(
     source = _make_valid_docx(tmp_path / "source.docx")
     output = tmp_path / "output.pdf"
 
-    pids_before = _running_word_pids()
+    pids_before = running_pids_for_image("WINWORD.EXE")
 
     with pytest.raises(TimeoutError):
         provider.convertir(source, output)
 
-    # Give the OS a brief moment to finish tearing down the killed
-    # process(es) before asserting — `taskkill`/process teardown is not
-    # necessarily instantaneous.
-    deadline = time.monotonic() + 10.0
-    orphaned = _running_word_pids() - pids_before
-    while orphaned and time.monotonic() < deadline:
-        time.sleep(0.5)
-        orphaned = _running_word_pids() - pids_before
-
-    assert not orphaned, (
-        f"Orphaned WINWORD.EXE process(es) left running after timeout: {orphaned}"
-    )
+    assert_no_orphaned_process("WINWORD.EXE", pids_before)
