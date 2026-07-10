@@ -8,15 +8,18 @@ Requirement: Azure Stub Provider Behavior.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app.core.providers.ocr_provider import RecognizedWord
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 
 class AzureOCRProvider:
     """`OCRProvider` implementation backed by Azure Document Intelligence — not yet implemented."""
 
-    def reconocer(self, image: Path) -> list[RecognizedWord]:
+    def reconocer(self, image: Image.Image) -> list[RecognizedWord]:
         """Raise `NotImplementedError` — Azure OCR is not implemented."""
         raise NotImplementedError(
             "Azure OCR is not implemented; set OCR_PROVIDER=tesseract."

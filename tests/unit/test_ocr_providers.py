@@ -8,19 +8,19 @@ covered here.
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from app.core.providers.azure_ocr_provider import AzureOCRProvider
 from app.core.providers.ocr_provider import OCRProvider, RecognizedWord
 
 
 def test_recognized_word_is_a_frozen_dataclass() -> None:
-    word = RecognizedWord(text="Factura", left=97, top=146, width=47, height=14, conf=91)
+    word = RecognizedWord(text="Factura", left=97, top=146, width=47, height=14)
 
     assert word.text == "Factura"
-    assert (word.left, word.top, word.width, word.height, word.conf) == (97, 146, 47, 14, 91)
+    assert (word.left, word.top, word.width, word.height) == (97, 146, 47, 14)
 
     with pytest.raises(FrozenInstanceError):
         word.text = "Total"  # type: ignore[misc]
@@ -32,9 +32,9 @@ def test_azure_provider_satisfies_the_protocol() -> None:
     assert isinstance(provider, OCRProvider)
 
 
-def test_azure_provider_reconocer_raises_not_implemented(tmp_path: Path) -> None:
+def test_azure_provider_reconocer_raises_not_implemented() -> None:
     provider = AzureOCRProvider()
-    image = tmp_path / "page.png"
+    image = Image.new("RGB", (10, 10), "white")
 
     with pytest.raises(NotImplementedError) as exc_info:
         provider.reconocer(image)
