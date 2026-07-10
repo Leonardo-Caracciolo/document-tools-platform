@@ -10,8 +10,8 @@ startup instead of continuing with an undefined value.
 tracebacks.
 
 `ConversorNoDisponibleError` and `ConversionFallidaError` are raised by
-`app.core.services.export_service` so `docx2pdf`/COM/`pywin32` failures
-never reach callers as raw tracebacks.
+`app.core.services.export_service` so COM/`pywin32` failures never reach
+callers as raw tracebacks.
 """
 
 from __future__ import annotations

@@ -50,6 +50,7 @@ import io
 import multiprocessing
 import platform
 import subprocess
+import threading
 import time
 import winreg
 from pathlib import Path
@@ -59,6 +60,16 @@ import win32com.client
 
 from app.core.exceptions import ConversorNoDisponibleError
 from app.infrastructure.logger import get_logger
+
+#: Serializes `convertir()` calls process-wide. Required by the PID
+#: snapshot-diff protocol in `_run_convert`: if two conversions raced,
+#: `_snapshot_word_pids()` (system-wide, not scoped to a single child)
+#: could see 0 or 2+ new PIDs and silently disarm the orphan-kill safety
+#: net for both. `pywin32`/COM automation is single-user-desktop-scale
+#: (SSD §5.2 — one TaskRunner-driven operation at a time from the UI
+#: anyway), so serializing here costs nothing in practice and closes a
+#: real correctness gap found in review.
+_CONVERSION_LOCK = threading.Lock()
 
 #: Overall wall-clock deadline for one conversion — spec's "Conversion
 #: Failure and Timeout Containment" requirement: "~60 seconds", folded
@@ -143,6 +154,10 @@ def _run_convert(source: Path, output: Path, queue: multiprocessing.Queue) -> No
     conversion_error: str | None = None
     try:
         word.Visible = False
+        # Suppress modal format-compatibility/repair prompts: an invisible
+        # dialog waiting for input would otherwise stall Open/SaveAs for
+        # the full timeout instead of completing normally.
+        word.DisplayAlerts = 0  # wdAlertsNone
         document = word.Documents.Open(str(source))
         try:
             document.SaveAs(str(output), FileFormat=_WD_FORMAT_PDF)
@@ -189,8 +204,6 @@ class ComWordProvider:
             return False, "COM/Word automation requires Windows."
         if importlib.util.find_spec("win32com") is None:
             return False, "pywin32 (win32com) is not installed."
-        if importlib.util.find_spec("docx2pdf") is None:
-            return False, "docx2pdf is not installed."
         try:
             key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "Word.Application")
         except FileNotFoundError:
@@ -210,7 +223,7 @@ class ComWordProvider:
                 the two-phase queue protocol is killed before this is
                 raised — see module docstring.
             RuntimeError: the child process reported a conversion failure
-                (raw COM/`docx2pdf` error).
+                (raw COM/pywin32 error).
 
         `TimeoutError`/`RuntimeError` are intentionally left uncaught
         here — `ExportService`'s `_translate_provider_errors` boundary
@@ -227,36 +240,54 @@ class ComWordProvider:
 
         self._log.info("ComWordProvider convert start: %s", source.name)
 
-        queue: multiprocessing.Queue = multiprocessing.Queue()
-        process = multiprocessing.Process(target=_run_convert, args=(source, output, queue))
-        process.start()
+        # Serialized: see _CONVERSION_LOCK docstring — the PID snapshot-diff
+        # protocol below is only unambiguous for one in-flight conversion.
+        with _CONVERSION_LOCK:
+            queue: multiprocessing.Queue = multiprocessing.Queue()
+            process = multiprocessing.Process(target=_run_convert, args=(source, output, queue))
+            process.start()
 
-        word_pid: int | None = None
-        terminal: tuple[str, object] | None = None
-        deadline = time.monotonic() + _TIMEOUT_SECONDS
+            word_pid: int | None = None
+            terminal: tuple[str, object] | None = None
+            deadline = time.monotonic() + _TIMEOUT_SECONDS
 
-        while terminal is None and time.monotonic() < deadline:
-            remaining = max(0.0, min(_POLL_INTERVAL_SECONDS, deadline - time.monotonic()))
-            try:
-                tag, payload = queue.get(timeout=remaining)
-            except Empty:
-                continue
-            if tag == "word_pid":
-                word_pid = payload
-            else:
-                terminal = (tag, payload)
+            while terminal is None and time.monotonic() < deadline:
+                remaining = max(0.0, min(_POLL_INTERVAL_SECONDS, deadline - time.monotonic()))
+                try:
+                    tag, payload = queue.get(timeout=remaining)
+                except Empty:
+                    continue
+                if tag == "word_pid":
+                    word_pid = payload
+                else:
+                    terminal = (tag, payload)
 
-        if terminal is None:
-            self._kill_process_and_word(process, word_pid, source)
-            raise TimeoutError(
-                f"Conversion of {source.name!r} did not complete within "
-                f"{_TIMEOUT_SECONDS:.0f}s."
-            )
+            if terminal is None:
+                # Deadline just passed on the polling loop's clock, but the
+                # child may have enqueued its terminal message a moment
+                # earlier — drain once more, non-blocking, before concluding
+                # this was a real timeout (avoids a spurious TimeoutError for
+                # a conversion that actually finished right at the boundary).
+                try:
+                    tag, payload = queue.get_nowait()
+                    if tag != "word_pid":
+                        terminal = (tag, payload)
+                except Empty:
+                    pass
 
-        process.join(timeout=_PROCESS_JOIN_TIMEOUT_SECONDS)
-        if process.is_alive():
-            process.kill()
+            if terminal is None:
+                self._kill_process_and_word(process, word_pid, source)
+                raise TimeoutError(
+                    f"Conversion of {source.name!r} did not complete within "
+                    f"{_TIMEOUT_SECONDS:.0f}s."
+                )
+
             process.join(timeout=_PROCESS_JOIN_TIMEOUT_SECONDS)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=_PROCESS_JOIN_TIMEOUT_SECONDS)
+            queue.close()
+            queue.join_thread()
 
         tag, payload = terminal
         if tag == "error":
@@ -284,9 +315,21 @@ class ComWordProvider:
             process.kill()
             process.join(timeout=_PROCESS_JOIN_TIMEOUT_SECONDS)
         if word_pid is not None:
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(word_pid)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            # Best-effort: this is the confirmed fix for the orphan-Word
+            # bug, but it must never itself raise in place of the
+            # TimeoutError the caller is about to see — a missing/blocked
+            # taskkill.exe (e.g. a locked-down deployment) shouldn't turn
+            # a timeout into an unrelated, undocumented exception.
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(word_pid)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                self._log.warning(
+                    "ComWordProvider could not taskkill orphaned Word PID %d for %s",
+                    word_pid,
+                    source.name,
+                )

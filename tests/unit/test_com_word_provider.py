@@ -8,7 +8,7 @@ orphan-`WINWORD.EXE` regression test — is covered by
 `tests/integration/test_com_word_provider.py` instead, since it requires
 real Word COM automation.
 
-This dev machine has pywin32, docx2pdf, and a registered `Word.Application`
+This dev machine has pywin32 and a registered `Word.Application`
 ProgID (confirmed empirically during design — see
 `sdd/word-to-pdf-provider/design`), so the "available" branch CAN be
 exercised for real, with no mocking — but GitHub-hosted `windows-latest`
@@ -91,27 +91,6 @@ def test_esta_disponible_reports_unavailable_when_win32com_missing(
 
     assert available is False
     assert "pywin32" in reason
-
-
-def test_esta_disponible_reports_unavailable_when_docx2pdf_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    original_find_spec = importlib.util.find_spec
-
-    def _fake_find_spec(name: str, *args: object, **kwargs: object) -> object:
-        if name == "docx2pdf":
-            return None
-        return original_find_spec(name, *args, **kwargs)
-
-    monkeypatch.setattr(
-        "app.core.providers.com_word_provider.importlib.util.find_spec", _fake_find_spec
-    )
-    provider = ComWordProvider()
-
-    available, reason = provider.esta_disponible()
-
-    assert available is False
-    assert "docx2pdf" in reason
 
 
 @pytest.mark.skipif(

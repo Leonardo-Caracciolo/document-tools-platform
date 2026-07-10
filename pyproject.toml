@@ -14,7 +14,6 @@ dependencies = [
     "img2pdf",
     "Pillow",
     "pymupdf>=1.24.9,<2",
-    "docx2pdf",
     "pywin32",
 ]
 
