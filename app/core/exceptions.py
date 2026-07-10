@@ -12,6 +12,10 @@ tracebacks.
 `ConversorNoDisponibleError` and `ConversionFallidaError` are raised by
 `app.core.services.export_service` so COM/`pywin32` failures never reach
 callers as raw tracebacks.
+
+`OCRNoDisponibleError` and `OCRFallidaError` are raised by
+`app.core.services.ocr_service` so `pytesseract`/Tesseract subprocess
+failures never reach callers as raw tracebacks.
 """
 
 from __future__ import annotations
@@ -43,3 +47,11 @@ class ConversorNoDisponibleError(Exception):
 
 class ConversionFallidaError(Exception):
     """Raised when a document conversion fails or exceeds its timeout."""
+
+
+class OCRNoDisponibleError(Exception):
+    """Raised when the active OCR provider is unavailable."""
+
+
+class OCRFallidaError(Exception):
+    """Raised when OCR recognition fails or exceeds its timeout."""
