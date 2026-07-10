@@ -486,6 +486,45 @@ class TestPdfAWordScannedRejection:
         assert "scanned.pdf" in warning_records[0].getMessage()
         assert str(tmp_path) not in warning_records[0].getMessage()
 
+    def test_text_only_on_a_later_page_still_counts_as_native_text(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: the detection gate sums non-whitespace chars across
+        EVERY page (`sum(... for page in doc)`), not just the first. A
+        regression to checking only page 1 would wrongly reject a PDF
+        whose real text lives on a later page."""
+        calls: list[str] = []
+
+        class _SpyConverter:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                calls.append("constructed")
+
+            def convert(self, *args: object, **kwargs: object) -> None:
+                calls.append("convert")
+                Path(args[0]).write_bytes(b"fake docx bytes")
+
+            def close(self) -> None:
+                calls.append("close")
+
+        monkeypatch.setattr("app.core.services.export_service.Converter", _SpyConverter)
+
+        source = tmp_path / "mixed_pages.pdf"
+        doc = pymupdf.open()
+        doc.new_page(width=612, height=792)  # page 1: blank, no text
+        page2 = doc.new_page(width=612, height=792)
+        page2.insert_text((72, 72), "Real extractable text lives only on page two.")
+        doc.save(source)
+        doc.close()
+
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        output = tmp_path / "out.docx"
+
+        result = service.pdf_a_word(source, output)
+
+        assert result == output
+        assert "constructed" in calls
+        assert "convert" in calls
+
 
 class TestPdfAWordCorruptPdf:
     def test_rejects_corrupt_pdf_at_open_time(
@@ -551,6 +590,8 @@ class TestPdfAWordConversionFailure:
         precedent for hard-to-trigger real failures (e.g.
         `ComWordProvider`'s timeout tests)."""
 
+        close_calls: list[bool] = []
+
         class _FailingConverter:
             def __init__(self, *args: object, **kwargs: object) -> None:
                 pass
@@ -560,7 +601,7 @@ class TestPdfAWordConversionFailure:
                 raise RuntimeError("simulated pdf2docx conversion failure")
 
             def close(self) -> None:
-                pass
+                close_calls.append(True)
 
         monkeypatch.setattr("app.core.services.export_service.Converter", _FailingConverter)
         service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
@@ -574,7 +615,50 @@ class TestPdfAWordConversionFailure:
 
         assert type(exc_info.value) is ConversionFallidaError
         assert not output.exists()
+        # Regression: cv.close() must run even when .convert() raises, or
+        # pdf2docx's underlying pymupdf handle on `source` leaks.
+        assert close_calls == [True]
+        # Regression: nothing outside the temp working area should survive
+        # a failed conversion — no stray "*.docx" siblings of `output`.
+        assert list(tmp_path.glob("*.docx")) == []
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("native.pdf" in r.getMessage() for r in warning_records)
         for record in warning_records:
             assert str(tmp_path) not in record.getMessage()
+
+    def test_preexisting_output_file_survives_a_conversion_failure_untouched(
+        self,
+        tmp_path: Path,
+        native_text_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression: an earlier revision unconditionally unlinked
+        `output` on any conversion failure. If `output` already pointed
+        at a pre-existing file (e.g. the caller overwriting a prior
+        successful run), that would DELETE the caller's original file
+        even though nothing succeeded — worse than leaving a partial
+        write. Converting into a temp path first (per the fix) means
+        `output` must never be touched at all on failure."""
+
+        class _FailingConverter:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def convert(self, docx_filename: str, *args: object, **kwargs: object) -> None:
+                raise RuntimeError("simulated pdf2docx conversion failure")
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr("app.core.services.export_service.Converter", _FailingConverter)
+        service = ExportService(provider=FakeDocumentConverterProvider("succeed"))
+        source = native_text_pdf_factory("native.pdf", "Some real text content here.")
+        output = tmp_path / "out.docx"
+        original_bytes = b"a pre-existing docx the caller does not want deleted"
+        output.write_bytes(original_bytes)
+
+        with pytest.raises(ConversionFallidaError):
+            service.pdf_a_word(source, output)
+
+        assert output.exists()
+        assert output.read_bytes() == original_bytes

@@ -27,6 +27,7 @@ behavior is untouched by it.
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -206,25 +207,40 @@ class ExportService:
         not just `.convert()`. A boundary that only wrapped `.convert()`
         would let that constructor-time exception escape uncaught.
 
-        Mapping:
-            `pymupdf.FileDataError`, `pymupdf.EmptyFileError` -> `PDFCorruptoError`
+        Mapping: any exception -> `PDFCorruptoError`. Deliberately a broad
+        `except Exception`, not narrowed to `pymupdf.FileDataError`/
+        `EmptyFileError` only: this boundary spans `page.get_text()`
+        across every page of an arbitrary user-supplied PDF, a much
+        larger and more heterogeneous surface than a single controlled
+        library call. `OCRService`'s own boundary (`ocr_service.py`) was
+        widened to `except Exception` for the identical reason, after a
+        narrower version let a raw exception escape uncaught on a real
+        input — don't repeat that gap here on a first pass.
         """
         try:
             yield
-        except (pymupdf.FileDataError, pymupdf.EmptyFileError) as exc:
+        except Exception as exc:
             self._log.warning("export failed: corrupt PDF (%s)", source.name)
             raise PDFCorruptoError(f"{source.name!r} is corrupt or unreadable.") from exc
 
     @contextmanager
-    def _translate_conversion_errors(
-        self, source: Path, output: Path
-    ) -> Generator[None, None, None]:
-        """Map raw `pdf2docx` exceptions raised while converting `source` to `output`.
+    def _translate_conversion_errors(self, source: Path) -> Generator[None, None, None]:
+        """Map raw `pdf2docx` exceptions raised while converting `source`.
 
-        Scoped to wrap ONLY the `Converter.convert()` call — `pdf2docx`'s
-        `.convert()` IS the write step (validate-then-write), so a
-        mid-conversion failure could leave a partial `output` file;
-        `output.unlink(missing_ok=True)` cleans it up before re-raising.
+        Scoped to wrap ONLY the `Converter.convert()` call. Deliberately
+        does NOT touch `output` itself — `pdf_a_word` converts into a
+        TEMP file first and only moves it to `output` on success (see
+        that method's docstring), so there is nothing at the real
+        `output` path for this boundary to clean up. An earlier revision
+        called `output.unlink(missing_ok=True)` here directly, which had
+        a real data-loss bug: if `output` already pointed at a
+        pre-existing file (e.g. the caller overwriting a prior
+        successful conversion), a failed `.convert()` would leave that
+        file partially overwritten by `pdf2docx`, and this cleanup would
+        then DELETE it outright — destroying the caller's original file
+        even though nothing succeeded. Converting into a temp path first
+        removes that risk entirely: `output` is never touched until
+        conversion is fully done.
 
         Mapping:
             any exception -> `ConversionFallidaError`, filename-only warning
@@ -233,7 +249,6 @@ class ExportService:
             yield
         except Exception as exc:
             self._log.warning("export failed: conversion error (%s)", source.name)
-            output.unlink(missing_ok=True)
             raise ConversionFallidaError(f"Conversion of {source.name!r} failed.") from exc
 
     def pdf_a_word(self, source: Path, output: Path) -> Path:
@@ -248,6 +263,16 @@ class ExportService:
         the only correct way to reject that input; detection never
         depends on `pdf2docx`'s own behavior.
 
+        Converts into a TEMP file first, then moves it to `output` only
+        on success (true validate-then-write): `pdf2docx.Converter` has
+        no separate "already validated, ready to write" midpoint the way
+        `pikepdf`/`pymupdf`-based operations do, and unlinking `output`
+        directly on failure would risk deleting a pre-existing file at
+        that path that had nothing to do with this call (see
+        `_translate_conversion_errors`'s docstring). Converting into a
+        temp path removes that risk: `output` is never touched until the
+        conversion is fully done.
+
         Raises:
             EntradaInvalidaError: `source` is not a `.pdf`, is missing/
                 empty, or `output`'s parent directory cannot be created.
@@ -260,8 +285,9 @@ class ExportService:
                 Message suggests running OCR PDF first. `pdf2docx` is
                 never invoked for this input.
             ConversionFallidaError: `pdf2docx` fails to convert an
-                otherwise-valid, native-text `source`. No partial
-                `output` file is left behind.
+                otherwise-valid, native-text `source`. `output` is left
+                untouched — including if it already existed before this
+                call.
         """
         self._log.info("export start: %s", source.name)
 
@@ -284,9 +310,36 @@ class ExportService:
         with self._translate_pdf_open_errors(source):
             cv = Converter(str(source))
 
-        with self._translate_conversion_errors(source, output):
-            cv.convert(str(output))
-        cv.close()
+        try:
+            try:
+                fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=output.parent)
+                os.close(fd)
+            except OSError as exc:
+                self._log.warning(
+                    "export failed: cannot create temp file (%s)", source.name
+                )
+                raise EntradaInvalidaError(
+                    f"Cannot create a temporary file near {output.name!r}."
+                ) from exc
+
+            tmp_path = Path(tmp_name)
+            try:
+                with self._translate_conversion_errors(source):
+                    cv.convert(str(tmp_path))
+                try:
+                    os.replace(tmp_path, output)
+                except OSError as exc:
+                    self._log.warning(
+                        "export failed: cannot finalize output (%s)", source.name
+                    )
+                    raise ConversionFallidaError(
+                        f"Conversion of {source.name!r} failed."
+                    ) from exc
+            except BaseException:
+                tmp_path.unlink(missing_ok=True)
+                raise
+        finally:
+            cv.close()
 
         self._log.info("export ok: %s -> %s", source.name, output.name)
         return output
