@@ -20,7 +20,7 @@ dependencies = [
 
 [dependency-groups]
 lint = ["ruff"]
-test = ["pytest"]
+test = ["pytest", "python-docx"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]
