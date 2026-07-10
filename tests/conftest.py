@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from tests.fixtures.docx_factory import make_valid_docx
+from tests.fixtures.image_pdf_factory import make_image_only_pdf
 from tests.fixtures.pdf_factory import (
     make_corrupt_jpg,
     make_corrupt_pdf,
@@ -102,5 +103,15 @@ def valid_docx_factory(tmp_path: Path) -> Callable[..., Path]:
 
     def _make(name: str = "valid.docx") -> Path:
         return make_valid_docx(tmp_path / name)
+
+    return _make
+
+
+@pytest.fixture
+def image_only_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes an image-only PDF (no selectable text) under `tmp_path`."""
+
+    def _make(name: str = "image_only.pdf", text: str = "Factura Total") -> Path:
+        return make_image_only_pdf(tmp_path / name, text)
 
     return _make
