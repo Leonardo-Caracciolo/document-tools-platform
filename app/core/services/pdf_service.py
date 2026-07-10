@@ -88,7 +88,7 @@ class PDFService:
             self._log.warning("%s failed: unsupported image (%s)", op, source.name)
             raise EntradaInvalidaError(f"{source.name!r} cannot be converted to PDF.") from exc
 
-    def _require_nonempty_file(self, source: Path) -> None:
+    def _require_nonempty_file(self, source: Path, op: Operation | None = None) -> None:
         """Raise `EntradaInvalidaError` if `source` is missing or 0 bytes.
 
         Must run BEFORE any `pikepdf.open()`/Pillow call: `pikepdf` raises
@@ -97,31 +97,54 @@ class PDFService:
         `_translate_errors` alone cannot tell "empty" and "corrupt" apart —
         checking file size first is the only way an empty input reads as
         invalid input (`EntradaInvalidaError`) rather than `PDFCorruptoError`.
+
+        `op` is optional so this helper stays unit-testable in isolation;
+        every real call site in this class passes it so the failure is
+        logged, per the spec's "any operation fails -> logged" requirement.
         """
         if not source.is_file() or source.stat().st_size == 0:
+            if op is not None:
+                self._log.warning("%s failed: missing or empty input (%s)", op, source.name)
             raise EntradaInvalidaError(f"{source.name!r} is empty or does not exist.")
 
-    def _validate_pages(self, pages: Sequence[int], page_count: int, source: Path) -> None:
+    def _validate_pages(
+        self, pages: Sequence[int], page_count: int, source: Path, op: Operation | None = None
+    ) -> None:
         """Raise `EntradaInvalidaError` if any 1-based `pages` entry is out of range.
 
         Called after the source PDF is opened (so `page_count` is known)
         and before any mutation. Does not reject duplicates — callers that
         must forbid duplicate page numbers (e.g. `organize`) apply that
         check separately.
+
+        `op` is optional (same reasoning as `_require_nonempty_file`).
         """
         if not pages:
+            if op is not None:
+                self._log.warning("%s failed: no pages specified (%s)", op, source.name)
             raise EntradaInvalidaError(f"No pages specified for {source.name!r}.")
         for page in pages:
             if page < 1 or page > page_count:
+                if op is not None:
+                    self._log.warning(
+                        "%s failed: page %d out of range (%s)", op, page, source.name
+                    )
                 raise EntradaInvalidaError(
                     f"Page {page} is out of range for {source.name!r} ({page_count} page(s))."
                 )
 
-    def _make_output_dir(self, directory: Path) -> None:
-        """Create `directory` (and parents) if needed, or raise `EntradaInvalidaError`."""
+    def _make_output_dir(self, directory: Path, op: Operation | None = None) -> None:
+        """Create `directory` (and parents) if needed, or raise `EntradaInvalidaError`.
+
+        `op` is optional (same reasoning as `_require_nonempty_file`).
+        """
         try:
             directory.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
+            if op is not None:
+                self._log.warning(
+                    "%s failed: cannot create output directory (%s)", op, directory.name
+                )
             raise EntradaInvalidaError(
                 f"Cannot create output directory {directory.name!r}."
             ) from exc
@@ -140,19 +163,20 @@ class PDFService:
             `PDFCorruptoError`: any input fails to parse.
         """
         if not inputs:
+            self._log.warning("merge failed: no input files provided")
             raise EntradaInvalidaError("No input files provided for merge.")
 
         self._log.info("merge start: %d input(s)", len(inputs))
 
         merged = pikepdf.Pdf.new()
         for source in inputs:
-            self._require_nonempty_file(source)
+            self._require_nonempty_file(source, "merge")
             with self._translate_errors("merge", source), pikepdf.Pdf.open(source) as pdf:
                 merged.pages.extend(pdf.pages)
 
         # Validation happens before any write: an invalid input mustn't
         # leave a newly-created (but never written) output directory behind.
-        self._make_output_dir(output.parent)
+        self._make_output_dir(output.parent, "merge")
         merged.save(output)
         self._log.info("merge ok: %d page(s) -> %s", len(merged.pages), output.name)
         return output
@@ -182,7 +206,7 @@ class PDFService:
                 or has `start > end`, or `output_dir` cannot be created.
             `PDFCorruptoError`: `source` fails to parse.
         """
-        self._require_nonempty_file(source)
+        self._require_nonempty_file(source, "split")
         self._log.info("split start: %s", source.name)
 
         outputs: list[Path] = []
@@ -194,15 +218,18 @@ class PDFService:
                 resolved_ranges = [(page, page) for page in range(1, page_count + 1)]
 
             pages_to_validate = [page for start, end in resolved_ranges for page in (start, end)]
-            self._validate_pages(pages_to_validate, page_count, source)
+            self._validate_pages(pages_to_validate, page_count, source, "split")
             for start, end in resolved_ranges:
                 if start > end:
+                    self._log.warning(
+                        "split failed: invalid range (%d, %d) (%s)", start, end, source.name
+                    )
                     raise EntradaInvalidaError(
                         f"Invalid range ({start}, {end}) for {source.name!r}."
                     )
 
             # All ranges validated: safe to create the output dir and write.
-            self._make_output_dir(output_dir)
+            self._make_output_dir(output_dir, "split")
             for start, end in resolved_ranges:
                 chunk = pikepdf.Pdf.new()
                 chunk.pages.extend(pdf.pages[start - 1 : end])
@@ -234,19 +261,22 @@ class PDFService:
                 cannot be created.
             `PDFCorruptoError`: `source` fails to parse.
         """
-        self._require_nonempty_file(source)
+        self._require_nonempty_file(source, "organize")
         self._log.info("organize start: %s", source.name)
 
         with self._translate_errors("organize", source), pikepdf.Pdf.open(source) as pdf:
             page_count = len(pdf.pages)
-            self._validate_pages(order, page_count, source)
+            self._validate_pages(order, page_count, source, "organize")
             if len(set(order)) != len(order):
+                self._log.warning(
+                    "organize failed: duplicate page number(s) in order spec (%s)", source.name
+                )
                 raise EntradaInvalidaError(
                     f"Duplicate page number(s) in order spec for {source.name!r}."
                 )
 
             # All entries validated: safe to create the output dir and write.
-            self._make_output_dir(output.parent)
+            self._make_output_dir(output.parent, "organize")
             reorganized = pikepdf.Pdf.new()
             reorganized.pages.extend(pdf.pages[page - 1] for page in order)
             reorganized.save(output)
@@ -282,20 +312,22 @@ class PDFService:
             `ArchivoProtegidoError`: `source` is already password-protected.
             `PDFCorruptoError`: `source` fails to parse.
         """
-        self._require_nonempty_file(source)
+        self._require_nonempty_file(source, "protect")
         if not owner_password or not owner_password.strip():
+            self._log.warning("protect failed: empty password (%s)", source.name)
             raise EntradaInvalidaError("Password must not be empty.")
 
         self._log.info("protect start: %s", source.name)
 
         with self._translate_errors("protect", source), pikepdf.Pdf.open(source) as pdf:
             if pdf.is_encrypted:
+                self._log.warning("protect failed: already password-protected (%s)", source.name)
                 raise ArchivoProtegidoError(
                     f"{source.name!r} is already password-protected; unlock it first."
                 )
 
             # Validated: safe to create the output dir and write.
-            self._make_output_dir(output.parent)
+            self._make_output_dir(output.parent, "protect")
             pdf.save(
                 output,
                 encryption=pikepdf.Encryption(
@@ -318,7 +350,7 @@ class PDFService:
             `ContrasenaInvalidaError`: `password` does not match `source`'s password.
             `PDFCorruptoError`: `source` fails to parse.
         """
-        self._require_nonempty_file(source)
+        self._require_nonempty_file(source, "unlock")
         self._log.info("unlock start: %s", source.name)
 
         with (
@@ -326,10 +358,11 @@ class PDFService:
             pikepdf.Pdf.open(source, password=password) as pdf,
         ):
             if not pdf.is_encrypted:
+                self._log.warning("unlock failed: not password-protected (%s)", source.name)
                 raise EntradaInvalidaError(f"{source.name!r} is not password-protected.")
 
             # Password verified and encryption confirmed: safe to write now.
-            self._make_output_dir(output.parent)
+            self._make_output_dir(output.parent, "unlock")
             pdf.save(output)
 
         self._log.info("unlock ok: %s -> %s", source.name, output.name)
@@ -362,12 +395,13 @@ class PDFService:
                 directory cannot be created.
         """
         if not images:
+            self._log.warning("jpg_to_pdf failed: no input images provided")
             raise EntradaInvalidaError("No input images provided for jpg_to_pdf.")
 
         self._log.info("jpg_to_pdf start: %d image(s)", len(images))
 
         for image in images:
-            self._require_nonempty_file(image)
+            self._require_nonempty_file(image, "jpg_to_pdf")
             with self._translate_errors("jpg_to_pdf", image), Image.open(image) as img:
                 img.verify()
 
@@ -383,7 +417,7 @@ class PDFService:
 
         # Conversion succeeded: only now is it safe to create the output
         # dir and write — see docstring for why this can't happen earlier.
-        self._make_output_dir(output.parent)
+        self._make_output_dir(output.parent, "jpg_to_pdf")
         output.write_bytes(pdf_bytes)
 
         self._log.info("jpg_to_pdf ok: %d image(s) -> %s", len(images), output.name)

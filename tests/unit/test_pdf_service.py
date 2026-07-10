@@ -763,3 +763,93 @@ class TestCrossCuttingLoggingAndExceptionContainment:
                     assert "not-the-password" not in message, (
                         f"{op_name} WARNING log leaked a password"
                     )
+
+    def test_all_validation_only_failures_log_warning_before_raising(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        valid_pdf_factory: Callable[..., Path],
+        encrypted_pdf_factory: Callable[..., Path],
+    ) -> None:
+        """Regression for the verify CRITICAL finding: direct-`raise`
+        validation sites (never routed through `_translate_errors`) must
+        also log a WARNING before propagating. Covers all ten call sites
+        named in the finding, across all six operations — not just the
+        library-boundary failures `test_all_six_ops_log_warning_...`
+        already exercises."""
+        service = PDFService()
+        two_page = valid_pdf_factory("two_page.pdf", pages=2)
+        owner_only_locked = encrypted_pdf_factory("owner_only.pdf", owner="owner-secret", user="")
+
+        blocked_by_file = tmp_path / "blocked_by_file"
+        blocked_by_file.write_bytes(b"not a directory")
+
+        validation_failures: dict[str, tuple[Callable[[], object], type[Exception]]] = {
+            "_require_nonempty_file (missing input)": (
+                lambda: service.merge(
+                    [tmp_path / "does-not-exist.pdf"], tmp_path / "merge_missing.pdf"
+                ),
+                EntradaInvalidaError,
+            ),
+            "_validate_pages (out-of-range)": (
+                lambda: service.split(two_page, tmp_path / "split_oor", ranges=[(1, 5)]),
+                EntradaInvalidaError,
+            ),
+            "_make_output_dir (cannot create)": (
+                lambda: service.merge([two_page], blocked_by_file / "sub" / "out.pdf"),
+                EntradaInvalidaError,
+            ),
+            "merge (zero files)": (
+                lambda: service.merge([], tmp_path / "merge_zero.pdf"),
+                EntradaInvalidaError,
+            ),
+            "split (start > end)": (
+                lambda: service.split(two_page, tmp_path / "split_bad_range", ranges=[(2, 1)]),
+                EntradaInvalidaError,
+            ),
+            "organize (duplicate index)": (
+                lambda: service.organize(two_page, tmp_path / "organize_dup.pdf", order=[1, 1]),
+                EntradaInvalidaError,
+            ),
+            "protect (empty password)": (
+                lambda: service.protect(
+                    two_page, tmp_path / "protect_empty_pwd.pdf", owner_password="   "
+                ),
+                EntradaInvalidaError,
+            ),
+            "protect (owner-only-encryption guard)": (
+                lambda: service.protect(
+                    owner_only_locked,
+                    tmp_path / "protect_reencrypt.pdf",
+                    owner_password="secret",
+                ),
+                ArchivoProtegidoError,
+            ),
+            "unlock (not encrypted)": (
+                lambda: service.unlock(
+                    two_page, tmp_path / "unlock_not_encrypted.pdf", password="whatever"
+                ),
+                EntradaInvalidaError,
+            ),
+            "jpg_to_pdf (zero images)": (
+                lambda: service.jpg_to_pdf([], tmp_path / "jpg_zero.pdf"),
+                EntradaInvalidaError,
+            ),
+        }
+
+        with caplog.at_level(logging.WARNING, logger="app.core.services.pdf_service"):
+            for site_name, (call, expected_exc) in validation_failures.items():
+                caplog.clear()
+                with pytest.raises(expected_exc):
+                    call()
+
+                warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+                assert warning_records, (
+                    f"{site_name} raised {expected_exc.__name__} but logged no WARNING record"
+                )
+                for record in warning_records:
+                    message = record.getMessage()
+                    assert str(tmp_path) not in message, (
+                        f"{site_name} WARNING log leaked an absolute path"
+                    )
+                    assert "secret" not in message, f"{site_name} WARNING log leaked a password"
