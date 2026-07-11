@@ -146,6 +146,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         "Protect PDF",
         "Secure",
         Family.D,
+        # An empty optional user_password (field left blank) becomes None,
+        # matching PDFService.protect's "owner-only" contract.
         lambda v: PDFService().protect(
             v.source,
             v.output,

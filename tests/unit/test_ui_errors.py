@@ -1,9 +1,8 @@
 """Tests for `app.ui.errors` — PR1 scope (foundation, no Tk root).
 
 Covers every mapped exception type in `ERROR_MESSAGES` (design §6:
-10 domain exceptions + `NotImplementedError`), the unmapped-exception
-fallback (`DEFAULT_ERROR_MESSAGE`, log-only, never raises), and the
-`isinstance` fallback walk.
+10 domain exceptions + `NotImplementedError`), and the unmapped-exception
+fallback (`DEFAULT_ERROR_MESSAGE`, log-only, never raises).
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ _LOGGER_NAME = "app.ui.errors"
 #: Exact designed message for every mapped exception type (design §6),
 #: independent of `ERROR_MESSAGES`'s own literal strings — this test file
 #: does not simply assert the map against itself.
-_EXPECTED_MESSAGES: dict[type[BaseException], str] = {
+_EXPECTED_MESSAGES: dict[type[Exception], str] = {
     EntradaInvalidaError: (
         "The input isn't valid. Check the selected file(s) and values, then try again."
     ),
@@ -59,7 +58,7 @@ def test_error_messages_covers_exactly_the_designed_11_entries() -> None:
 
 @pytest.mark.parametrize("exc_type", list(_EXPECTED_MESSAGES))
 def test_mapped_exception_resolves_to_exact_designed_message(
-    exc_type: type[BaseException],
+    exc_type: type[Exception],
 ) -> None:
     exc = exc_type("some raw library detail that must never be shown")
 

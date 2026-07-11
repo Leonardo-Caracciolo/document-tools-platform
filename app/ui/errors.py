@@ -9,10 +9,9 @@ must never reach the UI (spec's "Exception-to-Message Mapping"
 requirement).
 
 All domain exceptions in `app.core.exceptions` are flat `Exception`
-subclasses with no inheritance hierarchy among them, so exact `type(exc)`
-lookup is sufficient for them; the `isinstance` fallback walk exists for
-builtin-subclass edge cases (e.g. a `TimeoutError` subclass that isn't
-`NotImplementedError` itself, or any other future non-exact-match case).
+subclasses with no inheritance hierarchy among them, and `NotImplementedError`
+is never subclassed by anything this app raises — so exact `type(exc)`
+lookup covers every mapped case. No `isinstance` fallback is needed.
 """
 
 from __future__ import annotations
@@ -33,10 +32,8 @@ from app.infrastructure.logger import get_logger
 
 _logger = get_logger(__name__)
 
-#: Exception type -> human-readable message. Order matters only for the
-#: `isinstance` fallback walk in `error_message` below (dict iteration
-#: order is insertion order in Python 3.7+).
-ERROR_MESSAGES: dict[type[BaseException], str] = {
+#: Exception type -> human-readable message, matched by exact `type(exc)`.
+ERROR_MESSAGES: dict[type[Exception], str] = {
     EntradaInvalidaError: (
         "The input isn't valid. Check the selected file(s) and values, then try again."
     ),
@@ -57,26 +54,19 @@ ERROR_MESSAGES: dict[type[BaseException], str] = {
 }
 
 #: Shown for any exception type not present in `ERROR_MESSAGES` (by exact
-#: type or `isinstance` fallback). The unmapped exception's full traceback
-#: is logged (never shown) before this is returned.
+#: type). The unmapped exception's full traceback is logged (never shown)
+#: before this is returned.
 DEFAULT_ERROR_MESSAGE = "The operation failed. Please try again."
 
 
-def error_message(exc: BaseException) -> str:
+def error_message(exc: Exception) -> str:
     """Resolve `exc` to a human-readable message, never a raw traceback.
 
-    Lookup order: exact `type(exc)` match first, then an `isinstance`
-    fallback walk over `ERROR_MESSAGES` (covers a builtin-subclass edge
-    case an exact match would miss). If neither matches, the full
-    traceback is logged at ERROR level (log only — never returned/shown)
-    and `DEFAULT_ERROR_MESSAGE` is returned instead.
+    Looked up by exact `type(exc)`. If unmapped, the full traceback is
+    logged at ERROR level (log only — never returned/shown) and
+    `DEFAULT_ERROR_MESSAGE` is returned instead.
     """
     msg = ERROR_MESSAGES.get(type(exc))
-    if msg is None:
-        for exc_type, candidate in ERROR_MESSAGES.items():
-            if isinstance(exc, exc_type):
-                msg = candidate
-                break
     if msg is None:
         _logger.exception("Unmapped UI error", exc_info=exc)
         return DEFAULT_ERROR_MESSAGE
