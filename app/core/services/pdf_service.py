@@ -19,7 +19,7 @@ itself (see SSD §5.2). Every operation MUST call
 
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
@@ -567,9 +567,11 @@ class PDFService:
         """Map `position` to an `(x, y)` baseline point within `rect`.
 
         `insert_text`'s `point` argument is BASELINE-relative (confirmed
-        empirically against pymupdf 1.28.0 — a glyph inserted at
-        `point=(72, 50)` renders with its glyph box bottom near `y=53`,
-        not its top), so `top`/`bottom` are computed with that in mind:
+        empirically against this project's installed pymupdf 1.28.0,
+        within the `pymupdf>=1.24.9,<2` pinned range — a glyph inserted
+        at `point=(72, 50)` renders with its glyph box bottom near
+        `y=53`, not its top; re-verify if the pin is ever bumped), so
+        `top`/`bottom` are computed with that in mind:
         `top` sits one `_ADD_TEXT_FONTSIZE` below the margin (so the
         glyph's ascender clears the margin line), `bottom` sits directly
         on the margin (the baseline itself, descenders may dip slightly
@@ -611,6 +613,29 @@ class PDFService:
             return list(range(page_count))
         self._validate_pages([page], page_count, source, op)
         return [page - 1]
+
+    @staticmethod
+    def _search_and_mark(
+        doc: pymupdf.Document,
+        indices: Sequence[int],
+        query: str,
+        mark_page: Callable[[pymupdf.Page, list[pymupdf.Rect]], None],
+    ) -> int:
+        """Search `query` on each of `indices`, mark matches, return the total count.
+
+        Shared by `highlight_text`/`redact_text` — the search/accumulate
+        loop is identical between them; the only difference is what
+        "marking" a page's matches means (`mark_page` supplies that),
+        so this is the single place that loop is defined.
+        """
+        total = 0
+        for idx in indices:
+            pg = doc.load_page(idx)
+            rects = pg.search_for(query)
+            if rects:
+                mark_page(pg, rects)
+            total += len(rects)
+        return total
 
     def add_text(
         self, source: Path, output: Path, page: int, text: str, position: TextAnchor
@@ -684,19 +709,17 @@ class PDFService:
 
         self._log.info("highlight_text start: %s", source.name)
 
+        def _mark_highlight(pg: pymupdf.Page, rects: list[pymupdf.Rect]) -> None:
+            for rect in rects:
+                pg.add_highlight_annot(rect)
+
         with self._translate_pymupdf_errors("highlight_text", source):
             doc = pymupdf.open(source)
             try:
                 indices = self._resolve_target_pages(
                     page, doc.page_count, source, "highlight_text"
                 )
-                total = 0
-                for idx in indices:
-                    pg = doc.load_page(idx)
-                    rects = pg.search_for(query)
-                    for rect in rects:
-                        pg.add_highlight_annot(rect)
-                    total += len(rects)
+                total = self._search_and_mark(doc, indices, query, _mark_highlight)
 
                 if total == 0:
                     self._log.warning("highlight_text failed: no matches (%s)", source.name)
@@ -713,7 +736,9 @@ class PDFService:
         self._log.info("highlight_text ok: %s -> %s", source.name, output.name)
         return output
 
-    def redact_text(self, source: Path, output: Path, query: str, page: int | None = None) -> Path:
+    def redact_text(
+        self, source: Path, output: Path, query: str, page: int | None = None
+    ) -> Path:
         """Permanently remove every case-insensitive match of `query`, writing to `output`.
 
         Uses the mark-then-apply redaction sequence: every match on a
@@ -739,19 +764,16 @@ class PDFService:
 
         self._log.info("redact_text start: %s", source.name)
 
+        def _mark_redact(pg: pymupdf.Page, rects: list[pymupdf.Rect]) -> None:
+            for rect in rects:
+                pg.add_redact_annot(rect)
+            pg.apply_redactions()
+
         with self._translate_pymupdf_errors("redact_text", source):
             doc = pymupdf.open(source)
             try:
                 indices = self._resolve_target_pages(page, doc.page_count, source, "redact_text")
-                total = 0
-                for idx in indices:
-                    pg = doc.load_page(idx)
-                    rects = pg.search_for(query)
-                    for rect in rects:
-                        pg.add_redact_annot(rect)
-                    if rects:
-                        pg.apply_redactions()
-                    total += len(rects)
+                total = self._search_and_mark(doc, indices, query, _mark_redact)
 
                 if total == 0:
                     self._log.warning("redact_text failed: no matches (%s)", source.name)

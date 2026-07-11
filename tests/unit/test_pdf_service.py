@@ -811,6 +811,75 @@ class TestCompress:
         )
 
 
+class TestAnchorPoint:
+    """Direct tests for `PDFService._anchor_point`'s 5-branch coordinate math.
+
+    `test_add_text_places_text_findable_at_expected_region` below only
+    checks which QUADRANT the rendered text lands in — it would not catch
+    a subtler off-by-margin or off-by-fontsize error. These tests assert
+    exact `(x, y)` values against independently-computed expectations
+    (not by re-deriving `_anchor_point`'s own formula), matching this
+    file's convention of unit-testing private helpers directly (see
+    `test_validate_pages_*` above).
+    """
+
+    _RECT = pymupdf.Rect(0, 0, 612, 792)  # Letter page, points, origin top-left
+    _TEXT = "Hi"
+    # pymupdf.get_text_length("Hi", fontname="helv", fontsize=11) == this
+    # exact value (verified empirically, hardcoded so this test does not
+    # re-derive the same measurement `_anchor_point` itself performs).
+    _WIDTH = 10.384000062942505
+
+    def test_top_left(self) -> None:
+        service = PDFService()
+
+        point = service._anchor_point("top-left", self._RECT, self._TEXT)
+
+        assert point == pytest.approx((36, 47))
+
+    def test_top_right(self) -> None:
+        service = PDFService()
+
+        point = service._anchor_point("top-right", self._RECT, self._TEXT)
+
+        assert point == pytest.approx((612 - 36 - self._WIDTH, 47))
+
+    def test_bottom_left(self) -> None:
+        service = PDFService()
+
+        point = service._anchor_point("bottom-left", self._RECT, self._TEXT)
+
+        assert point == pytest.approx((36, 756))
+
+    def test_bottom_right(self) -> None:
+        service = PDFService()
+
+        point = service._anchor_point("bottom-right", self._RECT, self._TEXT)
+
+        assert point == pytest.approx((612 - 36 - self._WIDTH, 756))
+
+    def test_center(self) -> None:
+        service = PDFService()
+
+        point = service._anchor_point("center", self._RECT, self._TEXT)
+
+        assert point == pytest.approx((306 - self._WIDTH / 2, 396))
+
+    def test_bottom_is_a_larger_y_than_top_matching_pymupdfs_y_grows_down_origin(
+        self,
+    ) -> None:
+        """Regression guard: pymupdf's origin is top-left with y growing
+        DOWN, so "bottom" must be a LARGER y than "top" — an inverted
+        coordinate system would silently place text upside down relative
+        to its intended anchor."""
+        service = PDFService()
+
+        top_point = service._anchor_point("top-left", self._RECT, self._TEXT)
+        bottom_point = service._anchor_point("bottom-left", self._RECT, self._TEXT)
+
+        assert bottom_point[1] > top_point[1]
+
+
 class TestAddText:
     """Tests for `PDFService.add_text`."""
 
