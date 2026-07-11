@@ -121,12 +121,16 @@ class ToolView(ctk.CTkFrame):
             return
 
         self._enter_running()
-        self.task_runner.submit(
-            self.spec.run,
-            values,
-            on_success=self._on_success,
-            on_error=self._on_error,
-        )
+        try:
+            self.task_runner.submit(
+                self.spec.run,
+                values,
+                on_success=self._on_success,
+                on_error=self._on_error,
+            )
+        except Exception as exc:  # noqa: BLE001 - submit() can raise RuntimeError synchronously (wrong thread, after shutdown); must not leave the spinner running or Run disabled
+            self._exit_running()
+            self._show_error(exc)
 
     def _enter_running(self) -> None:
         """Disable Run, clear status, show + start the indeterminate spinner."""
