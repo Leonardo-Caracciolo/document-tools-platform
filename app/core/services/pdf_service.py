@@ -1,12 +1,13 @@
 """PDF/image operations service, per SSD §3.1/§4.1/§5.1.
 
-`PDFService` exposes seven pure, synchronous methods over `pikepdf`
+`PDFService` exposes ten pure, synchronous methods over `pikepdf`
 (merge/split/organize/protect/unlock), `img2pdf`+`Pillow`
-(jpg_to_pdf), and `pymupdf` (compress). Every method returns the
-written output path(s). Library exceptions are translated to domain
-exceptions (`app.core.exceptions`) at scoped boundaries
-(`_translate_errors` for pikepdf/img2pdf/Pillow, `_translate_pymupdf_errors`
-for pymupdf) so no raw library exception ever reaches a caller.
+(jpg_to_pdf), and `pymupdf` (compress, add_text, highlight_text,
+redact_text). Every method returns the written output path(s).
+Library exceptions are translated to domain exceptions
+(`app.core.exceptions`) at scoped boundaries (`_translate_errors` for
+pikepdf/img2pdf/Pillow, `_translate_pymupdf_errors` for pymupdf) so no
+raw library exception ever reaches a caller.
 
 Stateless and thread-safe: no config injection, no internal
 `TaskRunner.submit()` calls — a future UI composes
@@ -33,22 +34,45 @@ from app.core.exceptions import (
     ContrasenaInvalidaError,
     EntradaInvalidaError,
     PDFCorruptoError,
+    PDFSinCoincidenciasError,
 )
 from app.infrastructure.logger import get_logger
 
-#: The seven operations `_translate_errors`/`_translate_pymupdf_errors` can be
+#: The ten operations `_translate_errors`/`_translate_pymupdf_errors` can be
 #: called for. A closed `Literal` instead of a bare `str` so a typo'd op
 #: name (e.g. "unlok") fails type-checking instead of silently falling
 #: into the wrong exception branch below.
 Operation = Literal[
-    "merge", "split", "organize", "protect", "unlock", "jpg_to_pdf", "compress"
+    "merge",
+    "split",
+    "organize",
+    "protect",
+    "unlock",
+    "jpg_to_pdf",
+    "compress",
+    "add_text",
+    "highlight_text",
+    "redact_text",
 ]
+
+#: The five preset anchor positions `add_text` can place text at —
+#: see `_anchor_point`. Raw `(x, y)` coordinate input is explicitly out
+#: of scope (spec's Non-Requirements).
+TextAnchor = Literal["top-left", "top-right", "bottom-left", "bottom-right", "center"]
 
 #: `compress` recompression targets — see design's "Balanced constants"
 #: decision: 150 DPI is the on-screen/email sweet spot for scans/
 #: screenshots, JPEG quality 75 is the standard near-lossless threshold.
 _COMPRESS_DPI = 150
 _COMPRESS_JPEG_QUALITY = 75
+
+#: `add_text` layout constants. `_EDIT_MARGIN` is 0.5in at 72pt/in — the
+#: same margin used for every anchor edge. `_ADD_TEXT_FONTSIZE`/
+#: `_ADD_TEXT_FONTNAME` are fixed (no per-call override — spec's
+#: Non-Requirements exclude style customization).
+_EDIT_MARGIN = 36
+_ADD_TEXT_FONTSIZE = 11
+_ADD_TEXT_FONTNAME = "helv"
 
 
 class PDFService:
@@ -535,4 +559,211 @@ class PDFService:
         output.write_bytes(payload)
 
         self._log.info("compress ok: %s -> %s", source.name, output.name)
+        return output
+
+    def _anchor_point(
+        self, position: TextAnchor, rect: pymupdf.Rect, text: str
+    ) -> tuple[float, float]:
+        """Map `position` to an `(x, y)` baseline point within `rect`.
+
+        `insert_text`'s `point` argument is BASELINE-relative (confirmed
+        empirically against pymupdf 1.28.0 — a glyph inserted at
+        `point=(72, 50)` renders with its glyph box bottom near `y=53`,
+        not its top), so `top`/`bottom` are computed with that in mind:
+        `top` sits one `_ADD_TEXT_FONTSIZE` below the margin (so the
+        glyph's ascender clears the margin line), `bottom` sits directly
+        on the margin (the baseline itself, descenders may dip slightly
+        below). Right/center alignment need `text`'s measured width
+        (`pymupdf.get_text_length`) since the point is the text's left
+        edge, not its bounding box.
+        """
+        width = pymupdf.get_text_length(
+            text, fontname=_ADD_TEXT_FONTNAME, fontsize=_ADD_TEXT_FONTSIZE
+        )
+        left = rect.x0 + _EDIT_MARGIN
+        right = rect.x1 - _EDIT_MARGIN - width
+        top = rect.y0 + _EDIT_MARGIN + _ADD_TEXT_FONTSIZE
+        bottom = rect.y1 - _EDIT_MARGIN
+        center_x = (rect.x0 + rect.x1) / 2 - width / 2
+        center_y = (rect.y0 + rect.y1) / 2
+
+        points: dict[TextAnchor, tuple[float, float]] = {
+            "top-left": (left, top),
+            "top-right": (right, top),
+            "bottom-left": (left, bottom),
+            "bottom-right": (right, bottom),
+            "center": (center_x, center_y),
+        }
+        return points[position]
+
+    def _resolve_target_pages(
+        self, page: int | None, page_count: int, source: Path, op: Operation
+    ) -> list[int]:
+        """Return the 0-based page indices `highlight_text`/`redact_text` must search.
+
+        `page is None` means "search every page" — every resulting index
+        is in range by construction, so no validation is needed. An
+        explicit `page` is validated via `_validate_pages` (raises
+        `EntradaInvalidaError` for an out-of-range value) BEFORE any
+        search is performed, then converted to a single 0-based index.
+        """
+        if page is None:
+            return list(range(page_count))
+        self._validate_pages([page], page_count, source, op)
+        return [page - 1]
+
+    def add_text(
+        self, source: Path, output: Path, page: int, text: str, position: TextAnchor
+    ) -> Path:
+        """Insert `text` at the point mapped from `position` on `page`, writing to `output`.
+
+        `page` is 1-based. Validation (`_require_nonempty_file`, the
+        empty-text guard) runs before `source` is even opened; the
+        page-range check (`_validate_pages`) runs after opening, once
+        `doc.page_count` is known, before any mutation — same
+        validate-then-write convention as every other operation.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, `text`
+                is empty/blank, `page` is out of range, or `output`'s
+                parent directory cannot be created.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source, "add_text")
+        if not text or not text.strip():
+            self._log.warning("add_text failed: empty text (%s)", source.name)
+            raise EntradaInvalidaError("Text to add must not be empty.")
+
+        self._log.info("add_text start: %s", source.name)
+
+        with self._translate_pymupdf_errors("add_text", source):
+            doc = pymupdf.open(source)
+            try:
+                self._validate_pages([page], doc.page_count, source, "add_text")
+                pg = doc.load_page(page - 1)
+                point = self._anchor_point(position, pg.rect, text)
+                pg.insert_text(
+                    point, text, fontname=_ADD_TEXT_FONTNAME, fontsize=_ADD_TEXT_FONTSIZE
+                )
+
+                # Mutation succeeded: safe to create the output dir and write.
+                self._make_output_dir(output.parent, "add_text")
+                doc.save(output)
+            finally:
+                doc.close()
+
+        self._log.info("add_text ok: %s -> %s", source.name, output.name)
+        return output
+
+    def highlight_text(
+        self, source: Path, output: Path, query: str, page: int | None = None
+    ) -> Path:
+        """Highlight every case-insensitive match of `query`, writing to `output`.
+
+        `page=None` (default) searches every page; an explicit 1-based
+        `page` searches only that page. Matches are accumulated across
+        the FULL requested scope before deciding whether to raise
+        `PDFSinCoincidenciasError` — never after the first empty page —
+        so a query that matches on page 3 of a 5-page all-pages search
+        still succeeds. That raise (and every validation above it) runs
+        BEFORE `_make_output_dir`/`doc.save`, so a zero-match run leaves
+        no orphan output file.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, `query`
+                is empty/blank, `page` is out of range, or `output`'s
+                parent directory cannot be created.
+            `PDFCorruptoError`: `source` fails to parse.
+            `PDFSinCoincidenciasError`: zero matches across the
+                requested page scope.
+        """
+        self._require_nonempty_file(source, "highlight_text")
+        if not query or not query.strip():
+            self._log.warning("highlight_text failed: empty query (%s)", source.name)
+            raise EntradaInvalidaError("Search text must not be empty.")
+
+        self._log.info("highlight_text start: %s", source.name)
+
+        with self._translate_pymupdf_errors("highlight_text", source):
+            doc = pymupdf.open(source)
+            try:
+                indices = self._resolve_target_pages(
+                    page, doc.page_count, source, "highlight_text"
+                )
+                total = 0
+                for idx in indices:
+                    pg = doc.load_page(idx)
+                    rects = pg.search_for(query)
+                    for rect in rects:
+                        pg.add_highlight_annot(rect)
+                    total += len(rects)
+
+                if total == 0:
+                    self._log.warning("highlight_text failed: no matches (%s)", source.name)
+                    raise PDFSinCoincidenciasError(
+                        f"No matches for {query!r} in {source.name!r}."
+                    )
+
+                # Matches found and marked: safe to create the output dir and write.
+                self._make_output_dir(output.parent, "highlight_text")
+                doc.save(output)
+            finally:
+                doc.close()
+
+        self._log.info("highlight_text ok: %s -> %s", source.name, output.name)
+        return output
+
+    def redact_text(self, source: Path, output: Path, query: str, page: int | None = None) -> Path:
+        """Permanently remove every case-insensitive match of `query`, writing to `output`.
+
+        Uses the mark-then-apply redaction sequence: every match on a
+        page is marked via `add_redact_annot` first, and `apply_redactions()`
+        is called ONCE per page after all of that page's matches are
+        marked — confirmed empirically (pymupdf 1.28.0) that a single
+        `apply_redactions()` call strips every mark made on that page,
+        so calling it per-match would be redundant. Same full-scope-
+        then-raise zero-match ordering as `highlight_text`.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, `query`
+                is empty/blank, `page` is out of range, or `output`'s
+                parent directory cannot be created.
+            `PDFCorruptoError`: `source` fails to parse.
+            `PDFSinCoincidenciasError`: zero matches across the
+                requested page scope.
+        """
+        self._require_nonempty_file(source, "redact_text")
+        if not query or not query.strip():
+            self._log.warning("redact_text failed: empty query (%s)", source.name)
+            raise EntradaInvalidaError("Search text must not be empty.")
+
+        self._log.info("redact_text start: %s", source.name)
+
+        with self._translate_pymupdf_errors("redact_text", source):
+            doc = pymupdf.open(source)
+            try:
+                indices = self._resolve_target_pages(page, doc.page_count, source, "redact_text")
+                total = 0
+                for idx in indices:
+                    pg = doc.load_page(idx)
+                    rects = pg.search_for(query)
+                    for rect in rects:
+                        pg.add_redact_annot(rect)
+                    if rects:
+                        pg.apply_redactions()
+                    total += len(rects)
+
+                if total == 0:
+                    self._log.warning("redact_text failed: no matches (%s)", source.name)
+                    raise PDFSinCoincidenciasError(
+                        f"No matches for {query!r} in {source.name!r}."
+                    )
+
+                # Matches found and redacted: safe to create the output dir and write.
+                self._make_output_dir(output.parent, "redact_text")
+                doc.save(output)
+            finally:
+                doc.close()
+
+        self._log.info("redact_text ok: %s -> %s", source.name, output.name)
         return output

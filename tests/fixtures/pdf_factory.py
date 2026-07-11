@@ -134,6 +134,30 @@ def make_image_heavy_pdf(path: Path) -> Path:
     return path
 
 
+def make_text_pdf_with_matches(path: Path, pages_text: list[str]) -> Path:
+    """Write a multi-page PDF to `path`, one page per `pages_text` entry.
+
+    Each page gets its own `pages_text[i]` string inserted as real,
+    selectable text near the top-left (72, 72) via `page.insert_text` —
+    same pattern as `make_native_text_pdf`, extended to multiple pages
+    with independently controllable content per page. This lets
+    `highlight_text`/`redact_text` tests assert "matches on pages 1 and
+    3 only, page 2 untouched" per the spec's page-scope scenarios. Blank
+    pages (`""` entries) are supported for the "no match on this page"
+    case.
+    """
+    doc = pymupdf.open()
+    try:
+        for text in pages_text:
+            page = doc.new_page(width=612, height=792)
+            if text:
+                page.insert_text((72, 72), text)
+        doc.save(path)
+    finally:
+        doc.close()
+    return path
+
+
 def make_corrupt_jpg(path: Path) -> Path:
     """Write a non-image file (plain bytes, `.jpg` extension) to `path`.
 

@@ -3,8 +3,9 @@
 Covers the PR1 foundation (constructor, `_translate_errors` mapping,
 `_validate_pages` helper), the PR2 `merge`/`split` operations, the PR3
 `organize`/`protect`/`unlock` operations, the PR4 `jpg_to_pdf`
-operation, the `compress` operation, plus cross-cutting logging/
-exception-containment tests exercised across all seven operations.
+operation, the `compress` operation, the `edit-pdf` PR1 `add_text`/
+`highlight_text`/`redact_text` operations, plus cross-cutting logging/
+exception-containment tests exercised across all ten operations.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from app.core.exceptions import (
     ContrasenaInvalidaError,
     EntradaInvalidaError,
     PDFCorruptoError,
+    PDFSinCoincidenciasError,
 )
 from app.core.services.pdf_service import PDFService
 from tests.fixtures.pdf_factory import make_corrupt_pdf, make_empty_file, make_valid_pdf
@@ -809,14 +811,280 @@ class TestCompress:
         )
 
 
+class TestAddText:
+    """Tests for `PDFService.add_text`."""
+
+    @pytest.mark.parametrize(
+        "position", ["top-left", "top-right", "bottom-left", "bottom-right", "center"]
+    )
+    def test_add_text_places_text_findable_at_expected_region(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path], position: str
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        output = tmp_path / "edited.pdf"
+        text = "Anchor marker"
+
+        result = service.add_text(source, output, page=1, text=text, position=position)
+
+        assert result == output
+        doc = pymupdf.open(output)
+        try:
+            page = doc.load_page(0)
+            rects = page.search_for(text)
+            assert rects, f"text not found for position {position!r}"
+            rect = rects[0]
+            mid_x = (page.rect.x0 + page.rect.x1) / 2
+            mid_y = (page.rect.y0 + page.rect.y1) / 2
+            if "left" in position:
+                assert rect.x0 < mid_x
+            if "right" in position:
+                assert rect.x0 > mid_x
+            if "top" in position:
+                assert rect.y1 < mid_y
+            if "bottom" in position:
+                assert rect.y0 > mid_y
+            if position == "center":
+                assert abs((rect.x0 + rect.x1) / 2 - mid_x) < 50
+                assert abs((rect.y0 + rect.y1) / 2 - mid_y) < 50
+        finally:
+            doc.close()
+
+    def test_add_text_raises_entrada_invalida_for_empty_text(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.add_text(
+                source, tmp_path / "edited.pdf", page=1, text="   ", position="top-left"
+            )
+
+    def test_add_text_raises_entrada_invalida_for_out_of_range_page(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="5"):
+            service.add_text(
+                source, tmp_path / "edited.pdf", page=5, text="hi", position="top-left"
+            )
+
+
+class TestHighlightText:
+    """Tests for `PDFService.highlight_text`."""
+
+    def test_highlight_text_single_page_match_leaves_other_pages_untouched(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["invoice invoice", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "highlighted.pdf"
+
+        result = service.highlight_text(source, output, query="invoice", page=1)
+
+        assert result == output
+        doc = pymupdf.open(output)
+        try:
+            assert len(list(doc.load_page(0).annots())) == 2
+            assert len(list(doc.load_page(1).annots())) == 0
+        finally:
+            doc.close()
+
+    def test_highlight_text_all_pages_scope_spans_multiple_pages(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["total amount", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "highlighted.pdf"
+
+        service.highlight_text(source, output, query="total", page=None)
+
+        doc = pymupdf.open(output)
+        try:
+            assert len(list(doc.load_page(0).annots())) == 1
+            assert len(list(doc.load_page(1).annots())) == 0
+            assert len(list(doc.load_page(2).annots())) == 1
+        finally:
+            doc.close()
+
+    def test_highlight_text_zero_match_on_specific_page_raises(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["invoice invoice", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "highlighted.pdf"
+
+        with pytest.raises(PDFSinCoincidenciasError):
+            service.highlight_text(source, output, query="nonexistent", page=2)
+
+        assert not output.exists()
+
+    def test_highlight_text_zero_match_across_all_pages_raises(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["invoice invoice", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "highlighted.pdf"
+
+        with pytest.raises(PDFSinCoincidenciasError):
+            service.highlight_text(source, output, query="nonexistent", page=None)
+
+        assert not output.exists()
+
+    def test_highlight_text_raises_entrada_invalida_for_empty_query(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.highlight_text(source, tmp_path / "highlighted.pdf", query="   ")
+
+    def test_highlight_text_raises_entrada_invalida_for_out_of_range_page(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory("doc.pdf", pages_text=["invoice"])
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="9"):
+            service.highlight_text(source, tmp_path / "highlighted.pdf", query="invoice", page=9)
+
+    def test_highlight_annotation_survives_save_and_reload(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory("doc.pdf", pages_text=["invoice"])
+        service = PDFService()
+        output = tmp_path / "highlighted.pdf"
+
+        service.highlight_text(source, output, query="invoice", page=1)
+
+        doc = pymupdf.open(output)
+        try:
+            page = doc.load_page(0)
+            annots = list(page.annots())
+            assert len(annots) == 1
+            assert annots[0].type[1] == "Highlight"
+        finally:
+            doc.close()
+
+
+class TestRedactText:
+    """Tests for `PDFService.redact_text`."""
+
+    def test_redact_text_single_page_match_is_gone_from_extracted_text(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        """Spec scenario 'Matched text is unrecoverable after redaction' —
+        verifies real permanence via reload + `get_text()`, not just that
+        the method returned without raising."""
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["confidential data", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "redacted.pdf"
+
+        result = service.redact_text(source, output, query="confidential", page=1)
+
+        assert result == output
+        doc = pymupdf.open(output)
+        try:
+            page1 = doc.load_page(0)
+            assert page1.search_for("confidential") == []
+            assert "confidential" not in page1.get_text().lower()
+            assert len(list(doc.load_page(1).annots())) == 0
+            assert "total due" in doc.load_page(2).get_text().lower()
+        finally:
+            doc.close()
+
+    def test_redact_text_all_pages_scope_spans_multiple_pages(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["total amount", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "redacted.pdf"
+
+        service.redact_text(source, output, query="total", page=None)
+
+        doc = pymupdf.open(output)
+        try:
+            for idx in range(3):
+                assert "total" not in doc.load_page(idx).get_text().lower()
+        finally:
+            doc.close()
+
+    def test_redact_text_zero_match_on_specific_page_raises(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["invoice invoice", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "redacted.pdf"
+
+        with pytest.raises(PDFSinCoincidenciasError):
+            service.redact_text(source, output, query="nonexistent", page=2)
+
+        assert not output.exists()
+
+    def test_redact_text_zero_match_across_all_pages_raises(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory(
+            "doc.pdf", pages_text=["invoice invoice", "nothing here", "total due"]
+        )
+        service = PDFService()
+        output = tmp_path / "redacted.pdf"
+
+        with pytest.raises(PDFSinCoincidenciasError):
+            service.redact_text(source, output, query="nonexistent", page=None)
+
+        assert not output.exists()
+
+    def test_redact_text_raises_entrada_invalida_for_empty_query(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.redact_text(source, tmp_path / "redacted.pdf", query="")
+
+    def test_redact_text_raises_entrada_invalida_for_out_of_range_page(
+        self, tmp_path: Path, text_pdf_with_matches_factory: Callable[..., Path]
+    ) -> None:
+        source = text_pdf_with_matches_factory("doc.pdf", pages_text=["confidential"])
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="9"):
+            service.redact_text(
+                source, tmp_path / "redacted.pdf", query="confidential", page=9
+            )
+
+
 class TestCrossCuttingLoggingAndExceptionContainment:
-    """Cross-cutting tests (4.3/4.4) exercised across all seven operations.
+    """Cross-cutting tests (4.3/4.4) exercised across all seven pre-existing
+    operations, plus a dedicated containment test for the three new
+    `edit-pdf` PR1 text operations (`add_text`/`highlight_text`/
+    `redact_text`) below.
 
     Verifies every operation logs INFO on success and WARNING on
     failure via the Sprint 0 `get_logger` (filename-only messages, no
     absolute paths, no passwords), and that no raw
     `pikepdf`/`img2pdf`/`Pillow`/`pymupdf` exception ever surfaces to a
-    caller — only the four domain exceptions do.
+    caller — only the domain exceptions do.
     """
 
     _RAW_LIBRARY_EXCEPTIONS = (
@@ -1033,3 +1301,31 @@ class TestCrossCuttingLoggingAndExceptionContainment:
                         f"{site_name} WARNING log leaked an absolute path"
                     )
                     assert "secret" not in message, f"{site_name} WARNING log leaked a password"
+
+    def test_new_text_editing_ops_do_not_let_raw_pymupdf_exceptions_escape(
+        self, tmp_path: Path, corrupt_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Mirrors `test_compress_does_not_let_raw_pymupdf_exceptions_escape`
+        for the three `edit-pdf` PR1 text operations."""
+        source = corrupt_pdf_factory("corrupt.pdf")
+        service = PDFService()
+
+        calls: dict[str, Callable[[], object]] = {
+            "add_text": lambda: service.add_text(
+                source, tmp_path / "add_text_bad.pdf", page=1, text="hi", position="top-left"
+            ),
+            "highlight_text": lambda: service.highlight_text(
+                source, tmp_path / "highlight_bad.pdf", query="hi"
+            ),
+            "redact_text": lambda: service.redact_text(
+                source, tmp_path / "redact_bad.pdf", query="hi"
+            ),
+        }
+
+        for op_name, call in calls.items():
+            with pytest.raises(PDFCorruptoError) as exc_info:
+                call()
+
+            assert not isinstance(exc_info.value, self._RAW_LIBRARY_EXCEPTIONS), (
+                f"{op_name} let a raw library exception surface as {type(exc_info.value)!r}"
+            )

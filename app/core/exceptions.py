@@ -20,6 +20,11 @@ direction, when a PDF has extractable text but no detectable tables.
 `OCRNoDisponibleError` and `OCRFallidaError` are raised by
 `app.core.services.ocr_service` so `pytesseract`/Tesseract subprocess
 failures never reach callers as raw tracebacks.
+
+`PDFSinCoincidenciasError` is raised by `app.core.services.pdf_service`'s
+`highlight_text`/`redact_text`, alongside `EntradaInvalidaError` and
+`PDFCorruptoError`, when a text search finds zero matches in the
+requested page scope.
 """
 
 from __future__ import annotations
@@ -67,3 +72,8 @@ class OCRNoDisponibleError(Exception):
 
 class OCRFallidaError(Exception):
     """Raised when OCR recognition fails or exceeds its timeout."""
+
+
+class PDFSinCoincidenciasError(Exception):
+    """Raised when a highlight/redact text search finds no matches across
+    the requested page scope."""

@@ -24,6 +24,7 @@ from tests.fixtures.pdf_factory import (
     make_jpg,
     make_native_text_pdf,
     make_table_pdf,
+    make_text_pdf_with_matches,
     make_valid_pdf,
 )
 
@@ -142,6 +143,20 @@ def table_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
     ) -> Path:
         default_tables = [[["Header1", "Header2"], ["A1", "B1"], ["A2", "B2"]]]
         return make_table_pdf(tmp_path / name, tables if tables is not None else default_tables)
+
+    return _make
+
+
+@pytest.fixture
+def text_pdf_with_matches_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes a multi-page PDF with per-page
+    searchable text under `tmp_path`."""
+
+    def _make(name: str = "text_matches.pdf", pages_text: list[str] | None = None) -> Path:
+        default_pages_text = ["invoice invoice", "nothing here", "total due"]
+        return make_text_pdf_with_matches(
+            tmp_path / name, pages_text if pages_text is not None else default_pages_text
+        )
 
     return _make
 
