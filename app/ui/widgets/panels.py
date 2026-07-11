@@ -51,6 +51,17 @@ class InputPanel(ctk.CTkFrame):
         """
         raise NotImplementedError
 
+    @staticmethod
+    def _require_source_and_output(source: Path | None, output: Path | None) -> None:
+        """Shared guard for every family whose panel needs both (A/D/E).
+
+        Single source of truth for the "select both a source file and a
+        destination file" rule (ADR-004) — subclasses must not re-inline
+        this check, so a future change to it only needs one edit site.
+        """
+        if source is None or output is None:
+            raise EntradaInvalidaError(_SELECT_SOURCE_AND_OUTPUT)
+
 
 class SingleInSingleOutPanel(InputPanel):
     """Family A — single source file, single destination file.
@@ -77,8 +88,7 @@ class SingleInSingleOutPanel(InputPanel):
     def collect(self) -> PanelValues:
         source = self._source_row.path
         output = self._save_as_row.output
-        if source is None or output is None:
-            raise EntradaInvalidaError(_SELECT_SOURCE_AND_OUTPUT)
+        self._require_source_and_output(source, output)
         return PanelValues(source=source, output=output)
 
 
@@ -167,7 +177,7 @@ class SecretPanel(InputPanel):
         self._save_as_row = SaveAsRow(self, output_suffix, output_ext)
         self._source_row = SourceRow(self, on_change=self._save_as_row.set_source)
         self._password_rows: dict[str, PasswordRow] = {
-            field.key: PasswordRow(self, field.label, field.required) for field in secret_fields
+            field.key: PasswordRow(self, field.label) for field in secret_fields
         }
 
         self._source_row.grid(row=0, column=0, sticky="ew")
@@ -178,8 +188,7 @@ class SecretPanel(InputPanel):
     def collect(self) -> PanelValues:
         source = self._source_row.path
         output = self._save_as_row.output
-        if source is None or output is None:
-            raise EntradaInvalidaError(_SELECT_SOURCE_AND_OUTPUT)
+        self._require_source_and_output(source, output)
 
         secrets: dict[str, str] = {}
         for field in self._secret_fields:
@@ -223,8 +232,7 @@ class OrderPanel(InputPanel):
     def collect(self) -> PanelValues:
         source = self._source_row.path
         output = self._save_as_row.output
-        if source is None or output is None:
-            raise EntradaInvalidaError(_SELECT_SOURCE_AND_OUTPUT)
+        self._require_source_and_output(source, output)
 
         order = self._parse_order(self._order_entry.get())
         return PanelValues(source=source, output=output, order=order)

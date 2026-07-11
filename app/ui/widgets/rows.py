@@ -155,14 +155,14 @@ class PasswordRow(ctk.CTkFrame):
 
     Wraps a single `SecretField` (design §5) — masking is empirically
     confirmed safe (design §9 item 4: `.get()` still returns cleartext
-    while the widget displays `*`). `required` is exposed for the owning
-    `SecretPanel.collect()` guard (design §4, ADR-004); this row itself
-    never validates or raises.
+    while the widget displays `*`). This row never validates or raises;
+    the owning `SecretPanel.collect()` guard reads required-ness directly
+    from the `SecretField` it was built from (design §4, ADR-004), not
+    from this row, so there is exactly one source of truth for it.
     """
 
-    def __init__(self, master: ctk.CTkBaseClass, label: str, required: bool) -> None:
+    def __init__(self, master: ctk.CTkBaseClass, label: str) -> None:
         super().__init__(master, fg_color="transparent")
-        self.required = required
 
         ctk.CTkLabel(self, text=label).grid(row=0, column=0, sticky="w")
         self._entry = ctk.CTkEntry(self, show="*")
