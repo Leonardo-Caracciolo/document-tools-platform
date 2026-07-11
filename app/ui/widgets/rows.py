@@ -1,4 +1,4 @@
-"""Reusable row widgets shared by all 5 family input panels.
+"""Reusable row widgets shared by all 6 family input panels.
 
 Design: `sdd/acrobat-tools-ui/design` §4. Each row owns its own
 `tkinter.filedialog` call and stores the resulting selection on itself —

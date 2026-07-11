@@ -3,7 +3,7 @@
 
 Each panel subclasses `InputPanel(ctk.CTkFrame)` and exposes
 `collect() -> PanelValues`, performing its family's LOCAL GUARD (ADR-004,
-generalized across all 5 families per the finished spec): raising
+generalized across all 6 families per the finished spec): raising
 `EntradaInvalidaError` synchronously when required input is missing or
 malformed, before `ToolView._on_run` (PR3) ever calls
 `TaskRunner.submit`. This keeps the pre-submit local-validation path and
@@ -35,7 +35,7 @@ _SELECT_SOURCE_AND_OUTPUT = "Select both a source file and a destination file be
 
 
 class InputPanel(ctk.CTkFrame):
-    """Common base for all 5 family panels.
+    """Common base for all 6 family panels.
 
     Concrete subclasses mount their family's rows in `__init__` and
     override `collect()`. The base itself defines no rows — the input
