@@ -7,7 +7,7 @@ the Tk event loop. Sprint 1+ tool views and services attach to
 
 from __future__ import annotations
 
-import customtkinter
+import customtkinter as ctk
 
 from app.infrastructure.config import AppConfig
 from app.infrastructure.logger import configure_logging, get_logger
@@ -24,8 +24,8 @@ def main() -> None:
 
     # Global appearance calls (customtkinter requirement) must happen
     # BEFORE any widget is constructed, so these precede MainWindow().
-    customtkinter.set_appearance_mode("system")
-    customtkinter.set_default_color_theme("dark-blue")
+    ctk.set_appearance_mode("system")
+    ctk.set_default_color_theme("dark-blue")
 
     window = MainWindow()
     window.mainloop()

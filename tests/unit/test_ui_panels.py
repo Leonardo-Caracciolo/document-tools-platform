@@ -1,17 +1,20 @@
 """Tests for the 5 family input panels' `collect()` guard paths — PR2 scope.
 
-First live-Tk-root test fixture in this project (tasks artifact's Testing
+First live-Tk-root test module in this project (tasks artifact's Testing
 Strategy #3): `InputPanel` subclasses extend `ctk.CTkFrame`, so `collect()`
 can only be exercised against a real Tk root. Scoped narrowly to
 guard-path assertions per spec scenarios — NOT full widget
 rendering/visual tests. `filedialog` is never invoked: each row's stored
 value is set directly on its private attribute, bypassing the dialog
 entirely.
+
+Uses the session-scoped `tk_root` fixture from `tests/conftest.py`
+(shared with `test_ui_tool_view_lifecycle.py`) rather than defining its
+own — Tkinter does not reliably support multiple `Tk()` roots per process.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import customtkinter as ctk
@@ -26,15 +29,6 @@ from app.ui.widgets.panels import (
     SingleInDirOutPanel,
     SingleInSingleOutPanel,
 )
-
-
-@pytest.fixture(scope="module")
-def tk_root() -> Iterator[ctk.CTk]:
-    """One hidden, real Tk root shared across this module's tests only."""
-    root = ctk.CTk()
-    root.withdraw()
-    yield root
-    root.destroy()
 
 
 class TestSingleInSingleOutPanel:

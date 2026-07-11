@@ -7,9 +7,10 @@ tests never depend on committed binary files.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import customtkinter as ctk
 import pytest
 
 from tests.fixtures.docx_factory import make_valid_docx
@@ -143,3 +144,20 @@ def table_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
         return make_table_pdf(tmp_path / name, tables if tables is not None else default_tables)
 
     return _make
+
+
+@pytest.fixture(scope="session")
+def tk_root() -> Iterator[ctk.CTk]:
+    """One hidden, real Tk root shared across the whole test session.
+
+    Tkinter does not reliably support creating more than one `Tk()`/
+    `CTk()` root within a single process — a second root created after an
+    earlier one's `destroy()` can fail to locate its Tcl library (a
+    long-standing Tkinter limitation, not specific to this project). Every
+    test module that needs a live Tk root shares this single
+    session-scoped one instead of each defining its own.
+    """
+    root = ctk.CTk()
+    root.withdraw()
+    yield root
+    root.destroy()

@@ -101,11 +101,19 @@ class MainWindow(ctk.CTk):
             if self._active_fg_color is None:
                 self._active_fg_color = button.cget("fg_color")
                 self._active_hover_color = button.cget("hover_color")
-            button.configure(
-                fg_color=_SIDEBAR_IDLE_FG_COLOR, hover_color=_SIDEBAR_IDLE_HOVER_COLOR
-            )
+            self._set_idle(button)
             button.pack(fill="x", padx=14, pady=4)
             self._sidebar_buttons[spec.tool_id] = button
+
+    @staticmethod
+    def _set_idle(button: ctk.CTkButton) -> None:
+        """Paint `button` with the one shared idle sidebar style.
+
+        Single source of truth for the idle look — both `_build_sidebar`
+        (every button starts idle) and `_select` (the previously-active
+        button returns to idle) call this instead of re-inlining it.
+        """
+        button.configure(fg_color=_SIDEBAR_IDLE_FG_COLOR, hover_color=_SIDEBAR_IDLE_HOVER_COLOR)
 
     def _select(self, tool_id: str) -> None:
         """Swap the content area's single active view to `tool_id`'s.
@@ -122,9 +130,7 @@ class MainWindow(ctk.CTk):
         if self._active_tool_id is not None:
             previous_button = self._sidebar_buttons.get(self._active_tool_id)
             if previous_button is not None:
-                previous_button.configure(
-                    fg_color=_SIDEBAR_IDLE_FG_COLOR, hover_color=_SIDEBAR_IDLE_HOVER_COLOR
-                )
+                self._set_idle(previous_button)
 
         active_button = self._sidebar_buttons.get(tool_id)
         if active_button is not None:
