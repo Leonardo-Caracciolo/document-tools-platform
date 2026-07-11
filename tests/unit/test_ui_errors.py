@@ -1,8 +1,10 @@
-"""Tests for `app.ui.errors` — PR1 scope (foundation, no Tk root).
+"""Tests for `app.ui.errors` — PR1 scope (foundation, no Tk root), extended
+in PR2 for `sdd/edit-pdf`'s `PDFSinCoincidenciasError` entry.
 
 Covers every mapped exception type in `ERROR_MESSAGES` (design §6:
-10 domain exceptions + `NotImplementedError`), and the unmapped-exception
-fallback (`DEFAULT_ERROR_MESSAGE`, log-only, never raises).
+10 domain exceptions + `NotImplementedError`, plus `edit-pdf`'s
+`PDFSinCoincidenciasError`), and the unmapped-exception fallback
+(`DEFAULT_ERROR_MESSAGE`, log-only, never raises).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from app.core.exceptions import (
     OCRFallidaError,
     OCRNoDisponibleError,
     PDFCorruptoError,
+    PDFSinCoincidenciasError,
     PDFSinTablasError,
     PDFSinTextoError,
 )
@@ -27,7 +30,8 @@ from app.ui.errors import DEFAULT_ERROR_MESSAGE, ERROR_MESSAGES, error_message
 
 _LOGGER_NAME = "app.ui.errors"
 
-#: Exact designed message for every mapped exception type (design §6),
+#: Exact designed message for every mapped exception type (design §6,
+#: `sdd/edit-pdf/design` "Decision 2" for `PDFSinCoincidenciasError`),
 #: independent of `ERROR_MESSAGES`'s own literal strings — this test file
 #: does not simply assert the map against itself.
 _EXPECTED_MESSAGES: dict[type[Exception], str] = {
@@ -45,15 +49,16 @@ _EXPECTED_MESSAGES: dict[type[Exception], str] = {
         "This PDF has no extractable text (it may be a scanned image). Run OCR first."
     ),
     PDFSinTablasError: "No tables were found in this PDF to export.",
+    PDFSinCoincidenciasError: "No matches were found for that text in the selected page(s).",
     OCRNoDisponibleError: "OCR isn't available with the current configuration.",
     OCRFallidaError: "Text recognition failed. Please try again.",
     NotImplementedError: "This feature isn't available with the current configuration.",
 }
 
 
-def test_error_messages_covers_exactly_the_designed_11_entries() -> None:
+def test_error_messages_covers_exactly_the_designed_12_entries() -> None:
     assert set(ERROR_MESSAGES) == set(_EXPECTED_MESSAGES)
-    assert len(ERROR_MESSAGES) == 11
+    assert len(ERROR_MESSAGES) == 12
 
 
 @pytest.mark.parametrize("exc_type", list(_EXPECTED_MESSAGES))

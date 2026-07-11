@@ -25,6 +25,7 @@ from app.core.exceptions import (
     OCRFallidaError,
     OCRNoDisponibleError,
     PDFCorruptoError,
+    PDFSinCoincidenciasError,
     PDFSinTablasError,
     PDFSinTextoError,
 )
@@ -48,6 +49,7 @@ ERROR_MESSAGES: dict[type[Exception], str] = {
         "This PDF has no extractable text (it may be a scanned image). Run OCR first."
     ),
     PDFSinTablasError: "No tables were found in this PDF to export.",
+    PDFSinCoincidenciasError: "No matches were found for that text in the selected page(s).",
     OCRNoDisponibleError: "OCR isn't available with the current configuration.",
     OCRFallidaError: "Text recognition failed. Please try again.",
     NotImplementedError: "This feature isn't available with the current configuration.",

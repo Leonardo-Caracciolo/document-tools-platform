@@ -1,7 +1,7 @@
 """Data-driven tool registry — per SSD's "una vista por herramienta" and
 `sdd/acrobat-tools-ui/design` §5/§8.
 
-`TOOL_SPECS` is the single source of truth for all 12 UI-wired tool
+`TOOL_SPECS` is the single source of truth for all 13 UI-wired tool
 operations: each entry is a `ToolSpec` pairing a sidebar label/group/input
 family with an off-thread `run` callable that constructs the relevant
 service and calls its method. `SPEC_BY_ID` is the lookup `MainWindow` uses
@@ -39,6 +39,7 @@ class Family(Enum):
     C = auto()  # single-in / dir-out (split)
     D = auto()  # secret(s) + single-in / single-out (protect, unlock)
     E = auto()  # ordered-ints + single-in / single-out (organize)
+    F = auto()  # mode-selector: single-in / single-out, internal mode dropdown (edit_pdf)
 
 
 class OutputKind(Enum):
@@ -72,11 +73,16 @@ class PanelValues:
     output_dir: Path | None = None
     order: Sequence[int] | None = None
     secrets: dict[str, str] | None = None
+    mode: str | None = None
+    page: int | None = None
+    insert_text: str | None = None
+    search_query: str | None = None
+    position: str | None = None
 
 
 @dataclass(frozen=True)
 class ToolSpec:
-    """Declarative description of one of the 12 UI-wired tool operations.
+    """Declarative description of one of the 13 UI-wired tool operations.
 
     `run` is the OFF-thread service call (constructed and invoked on the
     `TaskRunner` worker thread, per design ADR-005 — never on the UI
@@ -111,11 +117,28 @@ def suggest_output_name(source: Path, suffix: str, ext: str) -> str:
     return f"{source.stem}{suffix}{ext}"
 
 
-#: Ordered, grouped registry of all 12 UI-wired tool operations — sidebar
+#: Mode -> off-thread dispatch lambda for `edit_pdf` (Family F). Keyed by
+#: the same mode strings `EditPanel.collect()` sets on `PanelValues.mode` —
+#: `EditPanel`'s local guard (ADR-004) guarantees `v.mode` is always one of
+#: these 3 keys by the time `_run_edit_pdf` reads it, so no `KeyError`
+#: fallback is needed (design §"Registry entry + dispatch").
+_EDIT_DISPATCH: dict[str, Callable[[PDFService, PanelValues], Path]] = {
+    "add_text": lambda s, v: s.add_text(v.source, v.output, v.page, v.insert_text, v.position),
+    "highlight_text": lambda s, v: s.highlight_text(v.source, v.output, v.search_query, v.page),
+    "redact_text": lambda s, v: s.redact_text(v.source, v.output, v.search_query, v.page),
+}
+
+
+def _run_edit_pdf(v: PanelValues) -> Path:
+    """Dispatch `edit_pdf`'s off-thread run to the mode-appropriate method."""
+    return _EDIT_DISPATCH[v.mode](PDFService(), v)
+
+
+#: Ordered, grouped registry of all 13 UI-wired tool operations — sidebar
 #: build order in `MainWindow` (PR3) follows this tuple's order exactly
 #: (design §5). Grouped: Organize (merge, split, organize), Secure
 #: (protect, unlock), Convert (convertir, pdf_a_word, pdf_a_excel,
-#: jpg_to_pdf, compress), Recognize (ocr, scan_to_pdf).
+#: jpg_to_pdf, compress), Recognize (ocr, scan_to_pdf), Edit (edit_pdf).
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     # group "Organize"
     ToolSpec(
@@ -247,6 +270,17 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         output_suffix="_scanned",
         output_ext=".pdf",
         icon="\U0001f4f7",  # 📷 camera — scanning images into a PDF
+    ),
+    # group "Edit"
+    ToolSpec(
+        "edit_pdf",
+        "Edit PDF",
+        "Edit",
+        Family.F,
+        _run_edit_pdf,
+        output_suffix="_edited",
+        output_ext=".pdf",
+        icon="✏",  # ✏ pencil — editing text on a page
     ),
 )
 

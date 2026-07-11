@@ -1,4 +1,5 @@
-"""5 family input panels — `sdd/acrobat-tools-ui/design` §4.
+"""6 family input panels — `sdd/acrobat-tools-ui/design` §4 (Family A-E) and
+`sdd/edit-pdf/design` (Family F, `EditPanel`).
 
 Each panel subclasses `InputPanel(ctk.CTkFrame)` and exposes
 `collect() -> PanelValues`, performing its family's LOCAL GUARD (ADR-004,
@@ -250,3 +251,170 @@ class OrderPanel(InputPanel):
             raise EntradaInvalidaError(
                 "Enter a comma-separated list of page numbers, e.g. 3,1,2,4."
             ) from exc
+
+
+#: `CTkOptionMenu` label -> `PanelValues.mode` string, per `sdd/edit-pdf/spec`
+#: "EditPanel Mode-Selector Field Visibility".
+_MODE_BY_LABEL: dict[str, str] = {
+    "Add text": "add_text",
+    "Highlight text": "highlight_text",
+    "Redact text": "redact_text",
+}
+_MODE_LABELS: tuple[str, ...] = tuple(_MODE_BY_LABEL)
+_DEFAULT_MODE_LABEL = "Add text"
+
+_POSITION_PRESETS: tuple[str, ...] = (
+    "top-left",
+    "top-right",
+    "bottom-left",
+    "bottom-right",
+    "center",
+)
+_DEFAULT_POSITION = "top-left"
+
+_EMPTY_INSERT_TEXT_MESSAGE = "Enter the text to insert before running."
+_EMPTY_SEARCH_QUERY_MESSAGE = "Enter the text to search for before running."
+_INVALID_PAGE_MESSAGE = "Enter a valid page number (1 or greater)."
+
+
+class EditPanel(InputPanel):
+    """Family F — mode-selector single-in/single-out panel (edit_pdf).
+
+    Add text / Highlight text / Redact text share one `SourceRow` +
+    `SaveAsRow` shell behind an internal mode `CTkOptionMenu`
+    (`sdd/edit-pdf/design` "UI Design" §`EditPanel`). `_on_mode_change`
+    `grid_forget()`s the inactive mode's field group and `grid()`s the
+    active one at its fixed rows — empty grid rows collapse to zero
+    height, so no visual gap. Default mode on construction is
+    `add_text` (spec "EditPanel Mode-Selector Field Visibility").
+
+    **Testing note (design's empirical finding, confirmed this
+    session)**: `CTkOptionMenu(command=cb)` fires `cb` on a REAL user
+    click (routed through the widget's internal `_dropdown_callback`),
+    but NOT on `.set()`. Any test that needs to exercise a mode switch
+    MUST call `panel._on_mode_change(value)` directly — calling
+    `panel._mode_menu.set(value)` will NOT invoke `_on_mode_change` and
+    the field groups will silently fail to swap.
+    """
+
+    def __init__(
+        self,
+        master: ctk.CTkBaseClass,
+        output_suffix: str = "",
+        output_ext: str = "",
+    ) -> None:
+        super().__init__(master)
+        self._mode: str = _MODE_BY_LABEL[_DEFAULT_MODE_LABEL]
+        self._save_as_row = SaveAsRow(self, output_suffix, output_ext)
+        self._source_row = SourceRow(self, on_change=self._save_as_row.set_source)
+
+        self._mode_menu = ctk.CTkOptionMenu(
+            self, values=list(_MODE_LABELS), command=self._on_mode_change
+        )
+        self._mode_menu.set(_DEFAULT_MODE_LABEL)
+
+        # ADD group (rows 2-4) — only visible in add_text mode.
+        self._add_page_label = ctk.CTkLabel(self, text="Page (1-based)")
+        self._add_page_entry = ctk.CTkEntry(self)
+        self._insert_text_label = ctk.CTkLabel(self, text="Text to insert")
+        self._insert_text_entry = ctk.CTkEntry(self)
+        self._position_label = ctk.CTkLabel(self, text="Position")
+        self._position_menu = ctk.CTkOptionMenu(self, values=list(_POSITION_PRESETS))
+        self._position_menu.set(_DEFAULT_POSITION)
+        self._add_group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...] = (
+            (self._add_page_label, self._add_page_entry),
+            (self._insert_text_label, self._insert_text_entry),
+            (self._position_label, self._position_menu),
+        )
+
+        # SEARCH group (rows 2-3) — shared by highlight_text/redact_text.
+        self._search_query_label = ctk.CTkLabel(self, text="Search text")
+        self._search_query_entry = ctk.CTkEntry(self)
+        self._search_page_label = ctk.CTkLabel(self, text="Page (blank = all pages)")
+        self._search_page_entry = ctk.CTkEntry(self)
+        self._search_group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...] = (
+            (self._search_query_label, self._search_query_entry),
+            (self._search_page_label, self._search_page_entry),
+        )
+
+        self._source_row.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._mode_menu.grid(row=1, column=0, columnspan=2, sticky="w")
+        self._grid_group(self._add_group)  # default mode = add_text
+        self._save_as_row.grid(row=5, column=0, columnspan=2, sticky="ew")
+
+    @staticmethod
+    def _grid_group(group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...]) -> None:
+        for row_index, (label, widget) in enumerate(group, start=2):
+            label.grid(row=row_index, column=0, sticky="w")
+            widget.grid(row=row_index, column=1, sticky="ew")
+
+    @staticmethod
+    def _forget_group(group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...]) -> None:
+        for label, widget in group:
+            label.grid_forget()
+            widget.grid_forget()
+
+    def _on_mode_change(self, value: str) -> None:
+        """`command=` target for `_mode_menu` — swaps the visible field group.
+
+        Real user clicks route through customtkinter's internal
+        `_dropdown_callback`, which invokes this. `.set()` does NOT (see
+        class docstring) — tests must call this method directly.
+        """
+        self._forget_group(self._add_group)
+        self._forget_group(self._search_group)
+        self._mode = _MODE_BY_LABEL[value]
+        if self._mode == "add_text":
+            self._grid_group(self._add_group)
+        else:
+            self._grid_group(self._search_group)
+
+    def collect(self) -> PanelValues:
+        source = self._source_row.path
+        output = self._save_as_row.output
+        self._require_source_and_output(source, output)
+
+        if self._mode == "add_text":
+            page = self._parse_page(self._add_page_entry.get())
+            insert_text = self._insert_text_entry.get()
+            if not insert_text.strip():
+                raise EntradaInvalidaError(_EMPTY_INSERT_TEXT_MESSAGE)
+            position = self._position_menu.get()
+            return PanelValues(
+                mode="add_text",
+                source=source,
+                output=output,
+                page=page,
+                insert_text=insert_text,
+                position=position,
+            )
+
+        search_query = self._search_query_entry.get()
+        if not search_query.strip():
+            raise EntradaInvalidaError(_EMPTY_SEARCH_QUERY_MESSAGE)
+        page = self._parse_optional_page(self._search_page_entry.get())
+        return PanelValues(
+            mode=self._mode,
+            source=source,
+            output=output,
+            search_query=search_query,
+            page=page,
+        )
+
+    @staticmethod
+    def _parse_page(raw: str) -> int:
+        """Parse a required 1-based page entry (add_text mode)."""
+        try:
+            page = int(raw.strip())
+        except ValueError as exc:
+            raise EntradaInvalidaError(_INVALID_PAGE_MESSAGE) from exc
+        if page < 1:
+            raise EntradaInvalidaError(_INVALID_PAGE_MESSAGE)
+        return page
+
+    @staticmethod
+    def _parse_optional_page(raw: str) -> int | None:
+        """Parse an optional page entry (highlight/redact mode) — blank = all pages."""
+        if not raw.strip():
+            return None
+        return EditPanel._parse_page(raw)

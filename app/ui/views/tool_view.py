@@ -23,6 +23,7 @@ from app.core.concurrency.task_runner import TaskRunner
 from app.ui.errors import error_message
 from app.ui.registry import Family, ToolSpec
 from app.ui.widgets.panels import (
+    EditPanel,
     InputPanel,
     MultiInSingleOutPanel,
     OrderPanel,
@@ -49,6 +50,9 @@ _PANEL_FACTORIES: dict[Family, Callable[[ctk.CTkBaseClass, ToolSpec], InputPanel
         output_ext=spec.output_ext,
     ),
     Family.E: lambda master, spec: OrderPanel(
+        master, output_suffix=spec.output_suffix, output_ext=spec.output_ext
+    ),
+    Family.F: lambda master, spec: EditPanel(
         master, output_suffix=spec.output_suffix, output_ext=spec.output_ext
     ),
 }

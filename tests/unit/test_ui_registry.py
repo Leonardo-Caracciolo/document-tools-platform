@@ -1,10 +1,12 @@
-"""Tests for `app.ui.registry` — PR1 scope (foundation, no Tk root).
+"""Tests for `app.ui.registry` — PR1 scope (foundation, no Tk root), extended
+in PR2 for `sdd/edit-pdf`'s `edit_pdf` (Family F) entry.
 
-Covers `TOOL_SPECS`/`SPEC_BY_ID` shape (12 entries, unique ids, design §4
+Covers `TOOL_SPECS`/`SPEC_BY_ID` shape (13 entries, unique ids, design §4
 family partition), each `ToolSpec.run` lambda's off-thread wiring
 (monkeypatched service classes — no real PDF/OCR/converter operation is
-ever exercised here), and `suggest_output_name`'s per-tool suffix/ext
-table (design §8).
+ever exercised here), `_EDIT_DISPATCH`/`_run_edit_pdf`'s per-mode wiring
+(`sdd/edit-pdf/design` "Registry entry + dispatch"), and
+`suggest_output_name`'s per-tool suffix/ext table (design §8).
 """
 
 from __future__ import annotations
@@ -26,8 +28,8 @@ from app.ui.registry import (
 
 
 class TestToolSpecsShape:
-    def test_exactly_12_entries(self) -> None:
-        assert len(TOOL_SPECS) == 12
+    def test_exactly_13_entries(self) -> None:
+        assert len(TOOL_SPECS) == 13
 
     def test_spec_by_id_covers_all_tool_ids_uniquely(self) -> None:
         tool_ids = [spec.tool_id for spec in TOOL_SPECS]
@@ -37,7 +39,7 @@ class TestToolSpecsShape:
         for tool_id, spec in SPEC_BY_ID.items():
             assert spec.tool_id == tool_id
 
-    def test_family_partition_matches_design_5_3_1_2_1(self) -> None:
+    def test_family_partition_matches_design_5_3_1_2_1_1(self) -> None:
         counts: dict[Family, int] = dict.fromkeys(Family, 0)
         for spec in TOOL_SPECS:
             counts[spec.family] += 1
@@ -48,6 +50,7 @@ class TestToolSpecsShape:
             Family.C: 1,
             Family.D: 2,
             Family.E: 1,
+            Family.F: 1,
         }
 
     def test_family_a_members(self) -> None:
@@ -69,6 +72,10 @@ class TestToolSpecsShape:
     def test_family_e_members(self) -> None:
         ids = {spec.tool_id for spec in TOOL_SPECS if spec.family is Family.E}
         assert ids == {"organize"}
+
+    def test_family_f_members(self) -> None:
+        ids = {spec.tool_id for spec in TOOL_SPECS if spec.family is Family.F}
+        assert ids == {"edit_pdf"}
 
     def test_split_has_directory_output_kind_and_no_secret_fields(self) -> None:
         split = SPEC_BY_ID["split"]
@@ -267,7 +274,68 @@ class TestRunWiring:
 
         mock_cls.return_value.scan_to_pdf.assert_called_once_with(inputs, output)
 
-    def test_all_12_tool_ids_have_wiring_coverage(self) -> None:
+    def test_edit_pdf_add_text_mode_calls_pdf_service_add_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = self._patch_service(monkeypatch, "PDFService")
+        source = Path("in.pdf")
+        output = Path("out.pdf")
+        values = PanelValues(
+            mode="add_text",
+            source=source,
+            output=output,
+            page=2,
+            insert_text="hello",
+            position="top-left",
+        )
+
+        SPEC_BY_ID["edit_pdf"].run(values)
+
+        mock_cls.return_value.add_text.assert_called_once_with(
+            source, output, 2, "hello", "top-left"
+        )
+
+    def test_edit_pdf_highlight_text_mode_calls_pdf_service_highlight_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = self._patch_service(monkeypatch, "PDFService")
+        source = Path("in.pdf")
+        output = Path("out.pdf")
+        values = PanelValues(
+            mode="highlight_text",
+            source=source,
+            output=output,
+            search_query="invoice",
+            page=None,
+        )
+
+        SPEC_BY_ID["edit_pdf"].run(values)
+
+        mock_cls.return_value.highlight_text.assert_called_once_with(
+            source, output, "invoice", None
+        )
+
+    def test_edit_pdf_redact_text_mode_calls_pdf_service_redact_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = self._patch_service(monkeypatch, "PDFService")
+        source = Path("in.pdf")
+        output = Path("out.pdf")
+        values = PanelValues(
+            mode="redact_text",
+            source=source,
+            output=output,
+            search_query="confidential",
+            page=3,
+        )
+
+        SPEC_BY_ID["edit_pdf"].run(values)
+
+        mock_cls.return_value.redact_text.assert_called_once_with(
+            source, output, "confidential", 3
+        )
+
+    def test_all_13_tool_ids_have_wiring_coverage(self) -> None:
         # Regression guard: fails loudly if a new ToolSpec is added to
         # TOOL_SPECS without a matching wiring test above.
         tested_ids = {
@@ -283,6 +351,7 @@ class TestRunWiring:
             "compress",
             "ocr",
             "scan_to_pdf",
+            "edit_pdf",
         }
         assert tested_ids == set(SPEC_BY_ID)
 
@@ -302,6 +371,7 @@ class TestSuggestOutputName:
             ("protect", "invoice.pdf", "invoice_protected.pdf"),
             ("unlock", "invoice.pdf", "invoice_unlocked.pdf"),
             ("organize", "invoice.pdf", "invoice_organized.pdf"),
+            ("edit_pdf", "invoice.pdf", "invoice_edited.pdf"),
         ],
     )
     def test_matches_per_tool_suffix_ext_table(
