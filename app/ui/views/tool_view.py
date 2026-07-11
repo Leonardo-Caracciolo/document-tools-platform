@@ -54,6 +54,19 @@ _PANEL_FACTORIES: dict[Family, Callable[[ctk.CTkBaseClass, ToolSpec], InputPanel
 }
 
 
+#: Status "pill" colors (cosmetic only, design polish pass) — idle is
+#: transparent (no background) so `status_label` reserves the same
+#: vertical space at rest as when a message is showing, and the layout
+#: never jumps when `_on_success`/`_show_error` set the text. Success/
+#: error tints are (light-mode, dark-mode) pairs, matching customtkinter's
+#: color-tuple convention.
+_STATUS_IDLE_FG_COLOR = "transparent"
+_STATUS_SUCCESS_FG_COLOR = ("#DCFCE7", "#14532D")
+_STATUS_SUCCESS_TEXT_COLOR = ("#15803D", "#86EFAC")
+_STATUS_ERROR_FG_COLOR = ("#FEE2E2", "#7F1D1D")
+_STATUS_ERROR_TEXT_COLOR = ("#B91C1C", "#FCA5A5")
+
+
 def format_success_message(result: Path | list[Path]) -> str:
     """Render a terminal success `result` as a one-line status message.
 
@@ -88,23 +101,41 @@ class ToolView(ctk.CTkFrame):
         self.spec = spec
 
         self.title_label = ctk.CTkLabel(
-            self, text=spec.label, font=ctk.CTkFont(size=18, weight="bold")
+            self, text=spec.label, font=ctk.CTkFont(size=20, weight="bold")
         )
-        self.title_label.pack(anchor="w", padx=16, pady=(16, 8))
+        self.title_label.pack(anchor="w", padx=20, pady=(20, 12))
 
-        self.panel: InputPanel = _PANEL_FACTORIES[spec.family](self, spec)
-        self.panel.pack(fill="x", padx=16, pady=8)
+        # Card wrapper — a subtly different fg_color than the page
+        # background so each tool's form reads as one distinct unit
+        # (cosmetic only; the panel factory dispatch/behavior is unchanged).
+        self.panel_card = ctk.CTkFrame(self, corner_radius=10, fg_color=("gray92", "gray17"))
+        self.panel_card.pack(fill="x", padx=20, pady=(0, 20))
 
-        self.run_button = ctk.CTkButton(self, text="Run", command=self._on_run)
-        self.run_button.pack(anchor="w", padx=16, pady=(8, 4))
+        self.panel: InputPanel = _PANEL_FACTORIES[spec.family](self.panel_card, spec)
+        self.panel.pack(fill="x", padx=18, pady=18)
+
+        self.run_button = ctk.CTkButton(
+            self,
+            text="Run",
+            command=self._on_run,
+            width=140,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.run_button.pack(anchor="w", padx=20, pady=(0, 12))
 
         # Indeterminate mode confirmed empirically (design §9 item 1). Not
         # packed here — hidden until `_enter_running()` makes it visible.
         self.spinner = ctk.CTkProgressBar(self)
         self.spinner.configure(mode="indeterminate")
 
-        self.status_label = ctk.CTkLabel(self, text="")
-        self.status_label.pack(anchor="w", padx=16, pady=(4, 16))
+        # Fixed height + always-packed (never pack_forget'd) so this row
+        # reserves the same vertical space whether idle or showing a
+        # success/error pill — the layout never jumps.
+        self.status_label = ctk.CTkLabel(
+            self, text="", height=32, corner_radius=8, fg_color=_STATUS_IDLE_FG_COLOR
+        )
+        self.status_label.pack(anchor="w", fill="x", padx=20, pady=(0, 20))
 
     def _on_run(self) -> None:
         """Run-button entry point (design §7).
@@ -135,8 +166,8 @@ class ToolView(ctk.CTkFrame):
     def _enter_running(self) -> None:
         """Disable Run, clear status, show + start the indeterminate spinner."""
         self.run_button.configure(state="disabled")
-        self.status_label.configure(text="")
-        self.spinner.pack(fill="x", padx=16, pady=(0, 8))
+        self.status_label.configure(text="", fg_color=_STATUS_IDLE_FG_COLOR)
+        self.spinner.pack(fill="x", padx=20, pady=(0, 12))
         self.spinner.start()
 
     def _exit_running(self) -> None:
@@ -154,7 +185,11 @@ class ToolView(ctk.CTkFrame):
     def _on_success(self, result: Path | list[Path]) -> None:
         """UI-thread success callback passed to `TaskRunner.submit`."""
         self._exit_running()
-        self.status_label.configure(text=format_success_message(result), text_color="green")
+        self.status_label.configure(
+            text=format_success_message(result),
+            text_color=_STATUS_SUCCESS_TEXT_COLOR,
+            fg_color=_STATUS_SUCCESS_FG_COLOR,
+        )
 
     def _on_error(self, exc: Exception) -> None:
         """UI-thread error callback passed to `TaskRunner.submit`."""
@@ -169,4 +204,8 @@ class ToolView(ctk.CTkFrame):
         for both this synchronous local-guard path and the async
         `_on_error` path.
         """
-        self.status_label.configure(text=error_message(exc), text_color="red")
+        self.status_label.configure(
+            text=error_message(exc),
+            text_color=_STATUS_ERROR_TEXT_COLOR,
+            fg_color=_STATUS_ERROR_FG_COLOR,
+        )

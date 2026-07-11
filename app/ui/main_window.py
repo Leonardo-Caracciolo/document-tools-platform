@@ -21,8 +21,17 @@ from app.ui.registry import SPEC_BY_ID, TOOL_SPECS
 from app.ui.views import ToolView
 
 WINDOW_TITLE = "Acrobat Tools"
-WINDOW_SIZE = "900x600"
+WINDOW_SIZE = "1050x680"
+WINDOW_MIN_SIZE = (900, 600)
 SIDEBAR_WIDTH = 220
+
+#: Sidebar button visual states (cosmetic only, design polish pass). Idle
+#: buttons read as flat list items; the active button is filled with the
+#: theme's own default button color (captured at build time in
+#: `_build_sidebar`, so it always matches whatever color theme is active)
+#: so exactly one sidebar entry ever looks "selected" at a time.
+_SIDEBAR_IDLE_FG_COLOR = "transparent"
+_SIDEBAR_IDLE_HOVER_COLOR = ("gray81", "gray21")
 
 
 class MainWindow(ctk.CTk):
@@ -39,6 +48,7 @@ class MainWindow(ctk.CTk):
         super().__init__()
         self.title(WINDOW_TITLE)
         self.geometry(WINDOW_SIZE)
+        self.minsize(*WINDOW_MIN_SIZE)
         self.task_runner = TaskRunner(
             scheduler=self.after, cancel_scheduled=self.after_cancel
         )
@@ -57,6 +67,10 @@ class MainWindow(ctk.CTk):
 
         self._views: dict[str, ToolView] = {}
         self._current: ToolView | None = None
+        self._sidebar_buttons: dict[str, ctk.CTkButton] = {}
+        self._active_tool_id: str | None = None
+        self._active_fg_color: str | tuple[str, str] | None = None
+        self._active_hover_color: str | tuple[str, str] | None = None
         self._build_sidebar()
 
     def _build_sidebar(self) -> None:
@@ -64,20 +78,34 @@ class MainWindow(ctk.CTk):
 
         A new `CTkLabel` group header is emitted whenever `group` changes
         from the previous entry — `TOOL_SPECS`'s tuple order (design §5)
-        is already grouped, so a single pass suffices.
+        is already grouped, so a single pass suffices. Each button is
+        recorded in `_sidebar_buttons` (keyed by `tool_id`) so `_select`
+        can toggle its idle/active visual state; the theme's own default
+        button colors are captured once (from the first button) as the
+        "active" style before every button is switched to the flat idle
+        style.
         """
         last_group: str | None = None
         for spec in TOOL_SPECS:
             if spec.group != last_group:
                 ctk.CTkLabel(
                     self.sidebar, text=spec.group, font=ctk.CTkFont(weight="bold")
-                ).pack(anchor="w", padx=12, pady=(12, 2))
+                ).pack(anchor="w", padx=16, pady=(16, 4))
                 last_group = spec.group
-            ctk.CTkButton(
+            button = ctk.CTkButton(
                 self.sidebar,
-                text=spec.label,
+                text=f"{spec.icon}  {spec.label}" if spec.icon else spec.label,
+                anchor="w",
                 command=partial(self._select, spec.tool_id),
-            ).pack(fill="x", padx=12, pady=2)
+            )
+            if self._active_fg_color is None:
+                self._active_fg_color = button.cget("fg_color")
+                self._active_hover_color = button.cget("hover_color")
+            button.configure(
+                fg_color=_SIDEBAR_IDLE_FG_COLOR, hover_color=_SIDEBAR_IDLE_HOVER_COLOR
+            )
+            button.pack(fill="x", padx=14, pady=4)
+            self._sidebar_buttons[spec.tool_id] = button
 
     def _select(self, tool_id: str) -> None:
         """Swap the content area's single active view to `tool_id`'s.
@@ -86,8 +114,25 @@ class MainWindow(ctk.CTk):
         its in-progress input state is preserved for when the user
         returns to it, then lazily instantiates (or reuses the cached)
         target view and mounts it (spec's "Sidebar/Registry Navigation"
-        requirement, design §5).
+        requirement, design §5). Also resets the previously-active
+        sidebar button to its idle style and paints the newly-active one
+        with the captured "active" style, so exactly one button shows
+        which tool is currently selected.
         """
+        if self._active_tool_id is not None:
+            previous_button = self._sidebar_buttons.get(self._active_tool_id)
+            if previous_button is not None:
+                previous_button.configure(
+                    fg_color=_SIDEBAR_IDLE_FG_COLOR, hover_color=_SIDEBAR_IDLE_HOVER_COLOR
+                )
+
+        active_button = self._sidebar_buttons.get(tool_id)
+        if active_button is not None:
+            active_button.configure(
+                fg_color=self._active_fg_color, hover_color=self._active_hover_color
+            )
+        self._active_tool_id = tool_id
+
         if self._current is not None:
             self._current.pack_forget()
 

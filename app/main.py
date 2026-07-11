@@ -7,6 +7,8 @@ the Tk event loop. Sprint 1+ tool views and services attach to
 
 from __future__ import annotations
 
+import customtkinter
+
 from app.infrastructure.config import AppConfig
 from app.infrastructure.logger import configure_logging, get_logger
 from app.ui.main_window import MainWindow
@@ -19,6 +21,11 @@ def main() -> None:
     config = AppConfig.load()
     configure_logging(config.log_level)
     _logger.info("Starting Acrobat Tools")
+
+    # Global appearance calls (customtkinter requirement) must happen
+    # BEFORE any widget is constructed, so these precede MainWindow().
+    customtkinter.set_appearance_mode("system")
+    customtkinter.set_default_color_theme("dark-blue")
 
     window = MainWindow()
     window.mainloop()

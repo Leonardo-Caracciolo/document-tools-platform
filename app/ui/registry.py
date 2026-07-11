@@ -94,6 +94,10 @@ class ToolSpec:
     output_ext: str = ""
     output_kind: OutputKind = OutputKind.FILE
     secret_fields: tuple[SecretField, ...] = ()
+    #: Restrained single-glyph sidebar icon (design polish pass — cosmetic
+    #: only). Trailing field with a default so existing positional/keyword
+    #: `ToolSpec(...)` construction stays valid.
+    icon: str = ""
 
 
 def suggest_output_name(source: Path, suffix: str, ext: str) -> str:
@@ -122,6 +126,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda v: PDFService().merge(v.inputs, v.output),
         output_suffix="_merged",
         output_ext=".pdf",
+        icon="\U0001f4d1",  # 📑 bookmark tabs — joining pages into one stack
     ),
     ToolSpec(
         "split",
@@ -130,6 +135,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         Family.C,
         lambda v: PDFService().split(v.source, v.output_dir, ranges=None),
         output_kind=OutputKind.DIRECTORY,
+        icon="✂",  # ✂ scissors — cutting pages apart
     ),
     ToolSpec(
         "organize",
@@ -139,6 +145,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda v: PDFService().organize(v.source, v.output, v.order),
         output_suffix="_organized",
         output_ext=".pdf",
+        icon="\U0001f5c2",  # 🗂 card index dividers — reordering pages
     ),
     # group "Secure"
     ToolSpec(
@@ -160,6 +167,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             SecretField("owner_password", "Owner password", True),
             SecretField("user_password", "User password (optional)", False),
         ),
+        icon="\U0001f512",  # 🔒 locked padlock
     ),
     ToolSpec(
         "unlock",
@@ -170,6 +178,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         output_suffix="_unlocked",
         output_ext=".pdf",
         secret_fields=(SecretField("password", "Password", True),),
+        icon="\U0001f513",  # 🔓 open padlock
     ),
     # group "Convert"
     ToolSpec(
@@ -179,6 +188,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         Family.A,
         lambda v: ExportService().convertir(v.source, v.output),
         output_ext=".pdf",
+        icon="\U0001f4c4",  # 📄 document — Word into PDF
     ),
     ToolSpec(
         "pdf_a_word",
@@ -187,6 +197,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         Family.A,
         lambda v: ExportService().pdf_a_word(v.source, v.output),
         output_ext=".docx",
+        icon="\U0001f4c3",  # 📃 page with curl — PDF into Word
     ),
     ToolSpec(
         "pdf_a_excel",
@@ -195,6 +206,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         Family.A,
         lambda v: ExportService().pdf_a_excel(v.source, v.output),
         output_ext=".xlsx",
+        icon="\U0001f4ca",  # 📊 bar chart — PDF into Excel
     ),
     ToolSpec(
         "jpg_to_pdf",
@@ -203,6 +215,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         Family.B,
         lambda v: PDFService().jpg_to_pdf(v.inputs, v.output),
         output_ext=".pdf",
+        icon="\U0001f5bc",  # 🖼 framed picture — JPG source into PDF
     ),
     ToolSpec(
         "compress",
@@ -212,6 +225,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda v: PDFService().compress(v.source, v.output),
         output_suffix="_compressed",
         output_ext=".pdf",
+        icon="\U0001f5dc",  # 🗜 clamp — compressing file size
     ),
     # group "Recognize"
     ToolSpec(
@@ -222,6 +236,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda v: OCRService().ocr(v.source, v.output),
         output_suffix="_ocr",
         output_ext=".pdf",
+        icon="\U0001f50d",  # 🔍 magnifying glass — reading text via OCR
     ),
     ToolSpec(
         "scan_to_pdf",
@@ -231,6 +246,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda v: ScanService().scan_to_pdf(v.inputs, v.output),
         output_suffix="_scanned",
         output_ext=".pdf",
+        icon="\U0001f4f7",  # 📷 camera — scanning images into a PDF
     ),
 )
 
