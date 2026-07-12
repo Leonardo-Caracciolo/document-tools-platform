@@ -449,6 +449,44 @@ class TestEditPanel:
         assert values.point is None
         assert values.position == "bottom-right"
 
+    # -- click-point invalidation on source/page/mode change — regression
+    # for a review-caught bug where a stale point kept winning in
+    # `collect()` after the page/document it was captured against was no
+    # longer selected (`sdd/edit-pdf-preview/apply-progress`) --
+
+    def test_on_source_change_clears_a_stale_click_point(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_preview_point((123.0, 456.0))
+        assert panel._click_point == (123.0, 456.0)
+
+        panel._on_source_change(Path("different.pdf"))
+
+        assert panel._click_point is None
+        assert panel._position_menu.get() == panels_module._DEFAULT_POSITION
+
+    def test_page_commit_clears_a_stale_click_point(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_preview_point((123.0, 456.0))
+        assert panel._click_point == (123.0, 456.0)
+
+        panel._refresh_preview_evt(event=None)
+
+        assert panel._click_point is None
+        assert panel._position_menu.get() == panels_module._DEFAULT_POSITION
+
+    def test_mode_change_away_and_back_clears_a_stale_click_point(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_preview_point((123.0, 456.0))
+        assert panel._click_point == (123.0, 456.0)
+
+        panel._on_mode_change("Highlight text")
+        panel._on_mode_change("Add text")
+
+        assert panel._click_point is None
+        assert panel._position_menu.get() == panels_module._DEFAULT_POSITION
+
     # -- `_refresh_preview` graceful degradation — `sdd/edit-pdf-preview/spec`
     # "Preview Rendering Graceful Degradation" --
 

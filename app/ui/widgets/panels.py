@@ -383,6 +383,7 @@ class EditPanel(InputPanel):
         `_dropdown_callback`, which invokes this. `.set()` does NOT (see
         class docstring) — tests must call this method directly.
         """
+        self._clear_click_point()
         self._forget_group(self._add_group)
         self._forget_group(self._search_group)
         self._preview.grid_forget()
@@ -393,14 +394,36 @@ class EditPanel(InputPanel):
         else:
             self._grid_group(self._search_group)
 
+    def _clear_click_point(self) -> None:
+        """Reset any stored preview click and its dropdown display.
+
+        A stored `_click_point` pertains to whichever page/document was
+        rendered at the moment of the click — every event that can
+        invalidate that render (a new source file, a different page
+        number, or leaving `add_text` mode and coming back) MUST clear
+        it too. Without this, `collect()` would keep forwarding a stale
+        point captured against a page/document that's no longer the one
+        selected, silently placing text at the wrong coordinates with no
+        error (this was a real bug caught by review on this exact PR —
+        see `sdd/edit-pdf-preview/apply-progress`). Distinct from
+        `_on_position_select`, which ALSO clears `_click_point` but must
+        NOT reset the dropdown display there, since it fires precisely
+        because the user just picked a real preset the menu should keep
+        showing.
+        """
+        self._click_point = None
+        self._position_menu.set(_DEFAULT_POSITION)
+
     def _on_source_change(self, path: Path | None) -> None:
         """`SourceRow.on_change` fan-out target.
 
         `SourceRow` supports exactly one callback — this fans it out to
         both `SaveAsRow.set_source` (its original target) and a preview
         refresh (`sdd/edit-pdf-preview/design` D3), without changing
-        `SourceRow`'s shared single-callback signature.
+        `SourceRow`'s shared single-callback signature. Clears any
+        stored click point first — see `_clear_click_point`.
         """
+        self._clear_click_point()
         self._save_as_row.set_source(path)
         self._refresh_preview()
 
@@ -421,7 +444,9 @@ class EditPanel(InputPanel):
         calls, including `_on_preview_point`'s, around `command=` — see
         `_on_mode_change`'s docstring for the same customtkinter
         behavior). `value` itself is unused: the menu's own `.get()`
-        already reflects the picked preset by the time this runs.
+        already reflects the picked preset by the time this runs. Does
+        NOT call `_clear_click_point()` — that would stomp the preset
+        the user just picked back to `_DEFAULT_POSITION`.
         """
         del value
         self._click_point = None
@@ -432,7 +457,11 @@ class EditPanel(InputPanel):
         Graceful degradation only (`sdd/edit-pdf-preview/spec` "Preview
         Rendering Graceful Degradation") — this method never raises and
         never blocks `Run`; full validation stays `collect()`'s and the
-        service's job.
+        service's job. Does NOT clear `_click_point` itself — callers
+        that can genuinely invalidate a stored point (`_on_source_change`,
+        `_refresh_preview_evt`) call `_clear_click_point()` themselves
+        before refreshing, so this method stays a pure render/placeholder
+        step reusable without that side effect.
         """
         source = self._source_row.path
         if source is None:
@@ -447,8 +476,14 @@ class EditPanel(InputPanel):
         self._preview.show(result)
 
     def _refresh_preview_evt(self, event: object) -> None:
-        """Thin `<FocusOut>`/`<Return>` bind wrapper — `_refresh_preview` takes no args."""
+        """`<FocusOut>`/`<Return>` bind wrapper for the page-number entry.
+
+        A page-number change can point the preview at a different page
+        of the same document, invalidating any stored click — clears it
+        (see `_clear_click_point`) before re-rendering.
+        """
         del event
+        self._clear_click_point()
         self._refresh_preview()
 
     def collect(self) -> PanelValues:
