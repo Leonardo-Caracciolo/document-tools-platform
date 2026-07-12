@@ -78,6 +78,7 @@ class PanelValues:
     insert_text: str | None = None
     search_query: str | None = None
     position: str | None = None
+    point: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -123,7 +124,9 @@ def suggest_output_name(source: Path, suffix: str, ext: str) -> str:
 #: these 3 keys by the time `_run_edit_pdf` reads it, so no `KeyError`
 #: fallback is needed (design §"Registry entry + dispatch").
 _EDIT_DISPATCH: dict[str, Callable[[PDFService, PanelValues], Path]] = {
-    "add_text": lambda s, v: s.add_text(v.source, v.output, v.page, v.insert_text, v.position),
+    "add_text": lambda s, v: s.add_text(
+        v.source, v.output, v.page, v.insert_text, v.position, v.point
+    ),
     "highlight_text": lambda s, v: s.highlight_text(v.source, v.output, v.search_query, v.page),
     "redact_text": lambda s, v: s.redact_text(v.source, v.output, v.search_query, v.page),
 }

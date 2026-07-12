@@ -292,7 +292,29 @@ class TestRunWiring:
         SPEC_BY_ID["edit_pdf"].run(values)
 
         mock_cls.return_value.add_text.assert_called_once_with(
-            source, output, 2, "hello", "top-left"
+            source, output, 2, "hello", "top-left", None
+        )
+
+    def test_edit_pdf_add_text_mode_forwards_click_point(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = self._patch_service(monkeypatch, "PDFService")
+        source = Path("in.pdf")
+        output = Path("out.pdf")
+        values = PanelValues(
+            mode="add_text",
+            source=source,
+            output=output,
+            page=2,
+            insert_text="hello",
+            position="top-left",
+            point=(123.0, 456.0),
+        )
+
+        SPEC_BY_ID["edit_pdf"].run(values)
+
+        mock_cls.return_value.add_text.assert_called_once_with(
+            source, output, 2, "hello", "top-left", (123.0, 456.0)
         )
 
     def test_edit_pdf_highlight_text_mode_calls_pdf_service_highlight_text(

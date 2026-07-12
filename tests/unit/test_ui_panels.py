@@ -29,12 +29,16 @@ silently, this is why — do not chase it as a production bug.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import customtkinter as ctk
 import pytest
+from PIL import Image
 
-from app.core.exceptions import EntradaInvalidaError
+from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError
+from app.core.services.pdf_service import PagePreviewResult
 from app.ui.registry import SecretField
+from app.ui.widgets import panels as panels_module
 from app.ui.widgets.panels import (
     EditPanel,
     MultiInSingleOutPanel,
@@ -393,3 +397,139 @@ class TestEditPanel:
 
         assert values.mode == "redact_text"
         assert values.page is None
+
+    # -- click-to-point / preset coexistence — `sdd/edit-pdf-preview/spec`
+    # "Click-to-Point Capture" / "Preset-vs-Click Precedence" --
+
+    def test_on_preview_point_sets_click_point_and_collect_returns_it(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._add_page_entry.insert(0, "2")
+        panel._insert_text_entry.insert(0, "hello")
+
+        panel._on_preview_point((123.0, 456.0))
+
+        assert panel._click_point == (123.0, 456.0)
+        assert panel._position_menu.get() == panels_module._CLICKED_POSITION_LABEL
+
+        values = panel.collect()
+
+        assert values.mode == "add_text"
+        assert values.point == (123.0, 456.0)
+        # `position` is a harmless placeholder here, not read/relied upon
+        # by the caller — the point-wins contract is enforced service-side
+        # (`PDFService.add_text` ignores `position` whenever `point` is
+        # not `None`), not by this panel.
+        assert values.position is not None
+
+    def test_on_position_select_after_click_clears_click_point(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._add_page_entry.insert(0, "2")
+        panel._insert_text_entry.insert(0, "hello")
+        panel._on_preview_point((123.0, 456.0))
+
+        # A real user dropdown pick updates the menu's own display before
+        # `command=` fires — mirror that ordering directly, same as this
+        # file's established `.set()`-doesn't-fire-`command` caveat for
+        # `_mode_menu` (class docstring above).
+        panel._position_menu.set("bottom-right")
+        panel._on_position_select("bottom-right")
+
+        assert panel._click_point is None
+
+        values = panel.collect()
+
+        assert values.point is None
+        assert values.position == "bottom-right"
+
+    # -- `_refresh_preview` graceful degradation — `sdd/edit-pdf-preview/spec`
+    # "Preview Rendering Graceful Degradation" --
+
+    def test_refresh_preview_shows_placeholder_when_source_is_none(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+
+        panel._refresh_preview()
+
+        assert panel._preview._ctk_image is None
+
+    def test_refresh_preview_shows_placeholder_when_page_is_blank(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        # page entry intentionally left blank
+
+        panel._refresh_preview()
+
+        assert panel._preview._ctk_image is None
+
+    def test_refresh_preview_shows_placeholder_when_page_is_invalid(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._add_page_entry.insert(0, "not-a-number")
+
+        panel._refresh_preview()
+
+        assert panel._preview._ctk_image is None
+
+    def test_refresh_preview_shows_placeholder_when_render_page_raises_entrada_invalida(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = MagicMock(name="PDFService")
+        mock_cls.return_value.render_page.side_effect = EntradaInvalidaError("out of range")
+        monkeypatch.setattr(panels_module, "PDFService", mock_cls)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._add_page_entry.insert(0, "99")
+
+        panel._refresh_preview()
+
+        assert panel._preview._ctk_image is None
+
+    def test_refresh_preview_shows_placeholder_when_render_page_raises_pdf_corrupto(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = MagicMock(name="PDFService")
+        mock_cls.return_value.render_page.side_effect = PDFCorruptoError("corrupt")
+        monkeypatch.setattr(panels_module, "PDFService", mock_cls)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._add_page_entry.insert(0, "2")
+
+        panel._refresh_preview()
+
+        assert panel._preview._ctk_image is None
+
+    def test_refresh_preview_shows_render_result_on_success(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result = PagePreviewResult(
+            image=Image.new("RGB", (100, 140), color="white"),
+            zoom=0.5,
+            origin=(0.0, 0.0),
+        )
+        mock_cls = MagicMock(name="PDFService")
+        mock_cls.return_value.render_page.return_value = result
+        monkeypatch.setattr(panels_module, "PDFService", mock_cls)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._add_page_entry.insert(0, "2")
+
+        panel._refresh_preview()
+
+        assert panel._preview._ctk_image is not None
+        assert panel._preview._zoom == 0.5
+        mock_cls.return_value.render_page.assert_called_once_with(
+            Path("in.pdf"), 2, panels_module._PREVIEW_MAX_W, panels_module._PREVIEW_MAX_H
+        )

@@ -21,8 +21,10 @@ from pathlib import Path
 
 import customtkinter as ctk
 
-from app.core.exceptions import EntradaInvalidaError
+from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError
+from app.core.services.pdf_service import PDFService
 from app.ui.registry import PanelValues, SecretField
+from app.ui.widgets.pdf_page_preview import PdfPagePreview
 from app.ui.widgets.rows import (
     DirectoryRow,
     FileListEditor,
@@ -276,6 +278,19 @@ _EMPTY_INSERT_TEXT_MESSAGE = "Enter the text to insert before running."
 _EMPTY_SEARCH_QUERY_MESSAGE = "Enter the text to search for before running."
 _INVALID_PAGE_MESSAGE = "Enter a valid page number (1 or greater)."
 
+#: Display label the position dropdown shows once a preview click has
+#: stored a point — never one of `_POSITION_PRESETS`, but `CTkOptionMenu`
+#: accepts and displays it via `.set()` regardless (confirmed empirically,
+#: `sdd/edit-pdf-preview/design` EMPIRICAL VERIFICATION RESULTS V4).
+_CLICKED_POSITION_LABEL = "Custom (clicked)"
+
+#: Recommended starting preview box, `sdd/edit-pdf-preview/design`'s real
+#: measurement against the live app (V5) — Letter-portrait fits comfortably
+#: within the panel's measured 731px width; height is the real binding
+#: constraint. Tuning-only constants (task 6.1), not architectural.
+_PREVIEW_MAX_W = 260
+_PREVIEW_MAX_H = 280
+
 
 class EditPanel(InputPanel):
     """Family F — mode-selector single-in/single-out panel (edit_pdf).
@@ -305,8 +320,9 @@ class EditPanel(InputPanel):
     ) -> None:
         super().__init__(master)
         self._mode: str = _MODE_BY_LABEL[_DEFAULT_MODE_LABEL]
+        self._click_point: tuple[float, float] | None = None
         self._save_as_row = SaveAsRow(self, output_suffix, output_ext)
-        self._source_row = SourceRow(self, on_change=self._save_as_row.set_source)
+        self._source_row = SourceRow(self, on_change=self._on_source_change)
 
         self._mode_menu = ctk.CTkOptionMenu(
             self, values=list(_MODE_LABELS), command=self._on_mode_change
@@ -316,16 +332,21 @@ class EditPanel(InputPanel):
         # ADD group (rows 2-4) — only visible in add_text mode.
         self._add_page_label = ctk.CTkLabel(self, text="Page (1-based)")
         self._add_page_entry = ctk.CTkEntry(self)
+        self._add_page_entry.bind("<FocusOut>", self._refresh_preview_evt)
+        self._add_page_entry.bind("<Return>", self._refresh_preview_evt)
         self._insert_text_label = ctk.CTkLabel(self, text="Text to insert")
         self._insert_text_entry = ctk.CTkEntry(self)
         self._position_label = ctk.CTkLabel(self, text="Position")
-        self._position_menu = ctk.CTkOptionMenu(self, values=list(_POSITION_PRESETS))
+        self._position_menu = ctk.CTkOptionMenu(
+            self, values=list(_POSITION_PRESETS), command=self._on_position_select
+        )
         self._position_menu.set(_DEFAULT_POSITION)
         self._add_group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...] = (
             (self._add_page_label, self._add_page_entry),
             (self._insert_text_label, self._insert_text_entry),
             (self._position_label, self._position_menu),
         )
+        self._preview = PdfPagePreview(self, on_point=self._on_preview_point)
 
         # SEARCH group (rows 2-3) — shared by highlight_text/redact_text.
         self._search_query_label = ctk.CTkLabel(self, text="Search text")
@@ -340,7 +361,8 @@ class EditPanel(InputPanel):
         self._source_row.grid(row=0, column=0, columnspan=2, sticky="ew")
         self._mode_menu.grid(row=1, column=0, columnspan=2, sticky="w")
         self._grid_group(self._add_group)  # default mode = add_text
-        self._save_as_row.grid(row=5, column=0, columnspan=2, sticky="ew")
+        self._preview.grid(row=5, column=0, columnspan=2, sticky="ew")
+        self._save_as_row.grid(row=6, column=0, columnspan=2, sticky="ew")
 
     @staticmethod
     def _grid_group(group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...]) -> None:
@@ -363,11 +385,71 @@ class EditPanel(InputPanel):
         """
         self._forget_group(self._add_group)
         self._forget_group(self._search_group)
+        self._preview.grid_forget()
         self._mode = _MODE_BY_LABEL[value]
         if self._mode == "add_text":
             self._grid_group(self._add_group)
+            self._preview.grid(row=5, column=0, columnspan=2, sticky="ew")
         else:
             self._grid_group(self._search_group)
+
+    def _on_source_change(self, path: Path | None) -> None:
+        """`SourceRow.on_change` fan-out target.
+
+        `SourceRow` supports exactly one callback — this fans it out to
+        both `SaveAsRow.set_source` (its original target) and a preview
+        refresh (`sdd/edit-pdf-preview/design` D3), without changing
+        `SourceRow`'s shared single-callback signature.
+        """
+        self._save_as_row.set_source(path)
+        self._refresh_preview()
+
+    def _on_preview_point(self, point: tuple[float, float]) -> None:
+        """`PdfPagePreview.on_point` callback — a click stores the point.
+
+        Sets the position dropdown's DISPLAY to a non-preset label; the
+        source of truth for `collect()` is `_click_point`, never this
+        string (`sdd/edit-pdf-preview/design` D4).
+        """
+        self._click_point = point
+        self._position_menu.set(_CLICKED_POSITION_LABEL)
+
+    def _on_position_select(self, value: str) -> None:
+        """`command=` target for `_position_menu` — clears any stored click point.
+
+        Fires only on a real user pick (customtkinter routes `.set()`
+        calls, including `_on_preview_point`'s, around `command=` — see
+        `_on_mode_change`'s docstring for the same customtkinter
+        behavior). `value` itself is unused: the menu's own `.get()`
+        already reflects the picked preset by the time this runs.
+        """
+        del value
+        self._click_point = None
+
+    def _refresh_preview(self) -> None:
+        """Re-render the preview, or show a neutral placeholder.
+
+        Graceful degradation only (`sdd/edit-pdf-preview/spec` "Preview
+        Rendering Graceful Degradation") — this method never raises and
+        never blocks `Run`; full validation stays `collect()`'s and the
+        service's job.
+        """
+        source = self._source_row.path
+        if source is None:
+            self._preview.show_placeholder()
+            return
+        try:
+            page = self._parse_page(self._add_page_entry.get())
+            result = PDFService().render_page(source, page, _PREVIEW_MAX_W, _PREVIEW_MAX_H)
+        except (EntradaInvalidaError, PDFCorruptoError):
+            self._preview.show_placeholder()
+            return
+        self._preview.show(result)
+
+    def _refresh_preview_evt(self, event: object) -> None:
+        """Thin `<FocusOut>`/`<Return>` bind wrapper — `_refresh_preview` takes no args."""
+        del event
+        self._refresh_preview()
 
     def collect(self) -> PanelValues:
         source = self._source_row.path
@@ -379,6 +461,16 @@ class EditPanel(InputPanel):
             insert_text = self._insert_text_entry.get()
             if not insert_text.strip():
                 raise EntradaInvalidaError(_EMPTY_INSERT_TEXT_MESSAGE)
+            if self._click_point is not None:
+                return PanelValues(
+                    mode="add_text",
+                    source=source,
+                    output=output,
+                    page=page,
+                    insert_text=insert_text,
+                    position=_DEFAULT_POSITION,
+                    point=self._click_point,
+                )
             position = self._position_menu.get()
             return PanelValues(
                 mode="add_text",
