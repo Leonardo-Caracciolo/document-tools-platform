@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -53,6 +54,7 @@ Operation = Literal[
     "add_text",
     "highlight_text",
     "redact_text",
+    "render_page",
 ]
 
 #: The five preset anchor positions `add_text` can place text at —
@@ -73,6 +75,23 @@ _COMPRESS_JPEG_QUALITY = 75
 _EDIT_MARGIN = 36
 _ADD_TEXT_FONTSIZE = 11
 _ADD_TEXT_FONTNAME = "helv"
+
+
+@dataclass(frozen=True)
+class PagePreviewResult:
+    """Result of `PDFService.render_page` — a page rendered to display size.
+
+    `image` is already at the size it should be displayed at (the
+    `zoom` used to render it was computed to fit within the caller's
+    `max_w`/`max_h` box), so no further scaling is needed by the
+    caller. `zoom` and `origin` (the page rect's `(x0, y0)`) are
+    exposed so a caller can map a pixel click on `image` back to a PDF
+    point: `pdf_point = (pixel_x / zoom + origin[0], pixel_y / zoom + origin[1])`.
+    """
+
+    image: Image.Image
+    zoom: float
+    origin: tuple[float, float]
 
 
 class PDFService:
@@ -638,15 +657,27 @@ class PDFService:
         return total
 
     def add_text(
-        self, source: Path, output: Path, page: int, text: str, position: TextAnchor
+        self,
+        source: Path,
+        output: Path,
+        page: int,
+        text: str,
+        position: TextAnchor,
+        point: tuple[float, float] | None = None,
     ) -> Path:
-        """Insert `text` at the point mapped from `position` on `page`, writing to `output`.
+        """Insert `text` on `page`, writing to `output`.
 
         `page` is 1-based. Validation (`_require_nonempty_file`, the
         empty-text guard) runs before `source` is even opened; the
         page-range check (`_validate_pages`) runs after opening, once
         `doc.page_count` is known, before any mutation — same
         validate-then-write convention as every other operation.
+
+        When `point` is provided, `text` is inserted at that exact
+        `(x, y)` and `position` is ignored entirely — not validated,
+        not consulted. When `point` is `None` (default), the insertion
+        point is derived from `position` via `_anchor_point`, unchanged
+        from prior behavior.
 
         Raises:
             `EntradaInvalidaError`: `source` is missing/0 bytes, `text`
@@ -666,9 +697,11 @@ class PDFService:
             try:
                 self._validate_pages([page], doc.page_count, source, "add_text")
                 pg = doc.load_page(page - 1)
-                point = self._anchor_point(position, pg.rect, text)
+                insertion = (
+                    point if point is not None else self._anchor_point(position, pg.rect, text)
+                )
                 pg.insert_text(
-                    point, text, fontname=_ADD_TEXT_FONTNAME, fontsize=_ADD_TEXT_FONTSIZE
+                    insertion, text, fontname=_ADD_TEXT_FONTNAME, fontsize=_ADD_TEXT_FONTSIZE
                 )
 
                 # Mutation succeeded: safe to create the output dir and write.
@@ -679,6 +712,37 @@ class PDFService:
 
         self._log.info("add_text ok: %s -> %s", source.name, output.name)
         return output
+
+    def render_page(self, source: Path, page: int, max_w: int, max_h: int) -> PagePreviewResult:
+        """Render `page` of `source` to a PIL image fit within `max_w` x `max_h`.
+
+        `page` is 1-based, same convention as every other page-taking
+        operation. The pixmap is rendered directly at the fit-to-box
+        `zoom` (`min(max_w / rect.width, max_h / rect.height)`) so the
+        returned image is already at display size — no separate
+        downscale step. `zoom` and the page rect's origin are returned
+        alongside the image so a caller can map a pixel click on the
+        image back to a PDF point (see `PagePreviewResult`).
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes, or
+                `page` is out of range.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source, "render_page")
+
+        with self._translate_pymupdf_errors("render_page", source):
+            doc = pymupdf.open(source)
+            try:
+                self._validate_pages([page], doc.page_count, source, "render_page")
+                pg = doc.load_page(page - 1)
+                zoom = min(max_w / pg.rect.width, max_h / pg.rect.height)
+                pix = pg.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+                return PagePreviewResult(
+                    image=pix.pil_image(), zoom=zoom, origin=(pg.rect.x0, pg.rect.y0)
+                )
+            finally:
+                doc.close()
 
     def highlight_text(
         self, source: Path, output: Path, query: str, page: int | None = None

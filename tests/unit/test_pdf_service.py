@@ -27,7 +27,7 @@ from app.core.exceptions import (
     PDFCorruptoError,
     PDFSinCoincidenciasError,
 )
-from app.core.services.pdf_service import PDFService
+from app.core.services.pdf_service import PagePreviewResult, PDFService
 from tests.fixtures.pdf_factory import make_corrupt_pdf, make_empty_file, make_valid_pdf
 
 
@@ -940,6 +940,112 @@ class TestAddText:
             service.add_text(
                 source, tmp_path / "edited.pdf", page=5, text="hi", position="top-left"
             )
+
+    def test_add_text_point_wins_over_position_regardless_of_preset(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """`point` MUST win over `position` even when `position` is a
+        different, otherwise-valid preset — `position` is not merely
+        deprioritized, it is not consulted at all (spec's "point present
+        overrides position" scenario)."""
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        output = tmp_path / "edited.pdf"
+        text = "Point marker"
+        point = (100.0, 200.0)
+
+        result = service.add_text(
+            source, output, page=1, text=text, position="center", point=point
+        )
+
+        assert result == output
+        doc = pymupdf.open(output)
+        try:
+            page = doc.load_page(0)
+            rects = page.search_for(text)
+            assert rects, "text not found near the requested point"
+            rect = rects[0]
+            # insert_text's point is baseline-relative (see
+            # `_anchor_point`'s docstring): the matched glyph box's
+            # left edge sits at point[0], its bottom near point[1].
+            # A "center" preset would have landed near (306, 396)
+            # instead, well outside these tolerances.
+            assert rect.x0 == pytest.approx(point[0], abs=5)
+            assert rect.y1 == pytest.approx(point[1], abs=15)
+        finally:
+            doc.close()
+
+    def test_add_text_point_none_falls_back_to_position(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """`point=None` (the default) MUST derive the insertion point from
+        `position`, exactly as before `point` existed."""
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        output = tmp_path / "edited.pdf"
+
+        result = service.add_text(
+            source, output, page=1, text="Preset marker", position="top-left"
+        )
+
+        assert result == output
+        doc = pymupdf.open(output)
+        try:
+            rects = doc.load_page(0).search_for("Preset marker")
+            assert rects
+        finally:
+            doc.close()
+
+
+class TestRenderPage:
+    """Tests for `PDFService.render_page`."""
+
+    def test_render_page_fits_to_box_with_correct_zoom_image_size_and_origin(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        max_w, max_h = 260, 280
+
+        result = service.render_page(source, page=1, max_w=max_w, max_h=max_h)
+
+        assert isinstance(result, PagePreviewResult)
+        expected_zoom = min(max_w / 612, max_h / 792)
+        assert result.zoom == pytest.approx(expected_zoom)
+        assert result.origin == pytest.approx((0.0, 0.0))
+        assert result.image.width == pytest.approx(round(612 * expected_zoom), abs=2)
+        assert result.image.height == pytest.approx(round(792 * expected_zoom), abs=2)
+
+    def test_render_page_raises_entrada_invalida_for_out_of_range_page(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="5"):
+            service.render_page(source, page=5, max_w=260, max_h=280)
+
+    def test_render_page_raises_entrada_invalida_for_empty_source(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.render_page(source, page=1, max_w=260, max_h=280)
+
+    def test_render_page_raises_pdf_corrupto_for_corrupt_source(
+        self, tmp_path: Path, corrupt_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = corrupt_pdf_factory("corrupt.pdf")
+        service = PDFService()
+
+        with pytest.raises(PDFCorruptoError) as exc_info:
+            service.render_page(source, page=1, max_w=260, max_h=280)
+
+        # No raw pymupdf exception escapes: `PDFCorruptoError` is a
+        # domain exception, unrelated to pymupdf's exception hierarchy.
+        assert not isinstance(exc_info.value, (pymupdf.FileDataError, pymupdf.EmptyFileError))
 
 
 class TestHighlightText:
