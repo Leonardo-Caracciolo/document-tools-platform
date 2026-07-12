@@ -284,12 +284,13 @@ _INVALID_PAGE_MESSAGE = "Enter a valid page number (1 or greater)."
 #: `sdd/edit-pdf-preview/design` EMPIRICAL VERIFICATION RESULTS V4).
 _CLICKED_POSITION_LABEL = "Custom (clicked)"
 
-#: Recommended starting preview box, `sdd/edit-pdf-preview/design`'s real
-#: measurement against the live app (V5) — Letter-portrait fits comfortably
-#: within the panel's measured 731px width; height is the real binding
-#: constraint. Tuning-only constants (task 6.1), not architectural.
-_PREVIEW_MAX_W = 260
-_PREVIEW_MAX_H = 280
+#: Preview box. Originally 260x280 (`sdd/edit-pdf-preview/design`'s V5
+#: measurement) to fit the window's fixed height with zero scroll — since
+#: `MainWindow.content` became a `CTkScrollableFrame`, height is no longer
+#: a hard ceiling, so this was widened to a more comfortable reading size.
+#: Letter-portrait at 500x650 renders to ~500x647px (zoom≈0.817).
+_PREVIEW_MAX_W = 500
+_PREVIEW_MAX_H = 650
 
 
 class EditPanel(InputPanel):

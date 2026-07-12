@@ -67,7 +67,16 @@ class MainWindow(ctk.CTk):
         # — unlike CTkFrame it does not need/support `grid_propagate`).
         self.sidebar = ctk.CTkScrollableFrame(self, width=SIDEBAR_WIDTH)
         self.sidebar.grid(row=0, column=0, sticky="ns")
-        self.content = ctk.CTkFrame(self)
+        # CTkScrollableFrame (not CTkFrame): a tool's content can be taller
+        # than the window (confirmed with Edit PDF's page preview, whose
+        # panel_card alone reaches ~484px against a 680px-tall default
+        # window with only 32px of slack, and clips outright at the
+        # 900x600 minsize) — a plain CTkFrame has no way to reach whatever
+        # overflows below the fold. `ToolView`'s existing `pack()`-based
+        # children mount inside a `CTkScrollableFrame` with no change
+        # (empirically confirmed — its internal content frame accepts the
+        # same `pack()` calls a plain frame would).
+        self.content = ctk.CTkScrollableFrame(self)
         self.content.grid(row=0, column=1, sticky="nsew")
 
         self._views: dict[str, ToolView] = {}
