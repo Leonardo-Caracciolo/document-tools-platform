@@ -59,9 +59,14 @@ class MainWindow(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.sidebar = ctk.CTkFrame(self, width=SIDEBAR_WIDTH)
+        # CTkScrollableFrame (not CTkFrame): once enough tools/groups are
+        # registered to exceed the window's vertical space (confirmed with
+        # 13 tools at the 900x600 minsize), a plain CTkFrame has no way to
+        # reach the buttons that overflow below the fold. Its own `width=`
+        # already holds fixed regardless of contents (empirically confirmed
+        # — unlike CTkFrame it does not need/support `grid_propagate`).
+        self.sidebar = ctk.CTkScrollableFrame(self, width=SIDEBAR_WIDTH)
         self.sidebar.grid(row=0, column=0, sticky="ns")
-        self.sidebar.grid_propagate(False)  # keep the fixed width regardless of button contents
         self.content = ctk.CTkFrame(self)
         self.content.grid(row=0, column=1, sticky="nsew")
 
