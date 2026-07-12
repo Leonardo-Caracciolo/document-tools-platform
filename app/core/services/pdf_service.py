@@ -724,12 +724,29 @@ class PDFService:
         alongside the image so a caller can map a pixel click on the
         image back to a PDF point (see `PagePreviewResult`).
 
+        `max_w`/`max_h` must both be positive: a Tk widget's
+        `winfo_width()`/`winfo_height()` return 0 (or 1) before it is
+        first realized, and a zero/negative box would otherwise silently
+        produce a `zoom=0.0`/0x0-pixel image with no error — which then
+        poisons `PagePreviewResult`'s documented pixel-to-point formula
+        with a division by zero the FIRST time a caller actually uses it.
+        Rejecting it here, at the one place `zoom` is computed, is cheaper
+        than every future caller having to guard against a degenerate
+        result.
+
         Raises:
-            `EntradaInvalidaError`: `source` is missing/0 bytes, or
-                `page` is out of range.
+            `EntradaInvalidaError`: `source` is missing/0 bytes, `page`
+                is out of range, or `max_w`/`max_h` is not positive.
             `PDFCorruptoError`: `source` fails to parse.
         """
         self._require_nonempty_file(source, "render_page")
+        if max_w <= 0 or max_h <= 0:
+            self._log.warning(
+                "render_page failed: non-positive box %sx%s (%s)", max_w, max_h, source.name
+            )
+            raise EntradaInvalidaError("max_w and max_h must both be positive.")
+
+        self._log.info("render_page start: %s", source.name)
 
         with self._translate_pymupdf_errors("render_page", source):
             doc = pymupdf.open(source)
@@ -738,11 +755,14 @@ class PDFService:
                 pg = doc.load_page(page - 1)
                 zoom = min(max_w / pg.rect.width, max_h / pg.rect.height)
                 pix = pg.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
-                return PagePreviewResult(
+                result = PagePreviewResult(
                     image=pix.pil_image(), zoom=zoom, origin=(pg.rect.x0, pg.rect.y0)
                 )
             finally:
                 doc.close()
+
+        self._log.info("render_page ok: %s", source.name)
+        return result
 
     def highlight_text(
         self, source: Path, output: Path, query: str, page: int | None = None

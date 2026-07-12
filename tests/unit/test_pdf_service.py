@@ -1003,18 +1003,27 @@ class TestRenderPage:
     def test_render_page_fits_to_box_with_correct_zoom_image_size_and_origin(
         self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
     ) -> None:
+        # 612x792 = valid_pdf_factory's underlying make_valid_pdf's fixed
+        # Letter page size in points (same page dims TestAnchorPoint's
+        # _RECT above uses).
         source = valid_pdf_factory("doc.pdf", pages=1)
         service = PDFService()
         max_w, max_h = 260, 280
+        page_w, page_h = 612, 792
 
         result = service.render_page(source, page=1, max_w=max_w, max_h=max_h)
 
         assert isinstance(result, PagePreviewResult)
-        expected_zoom = min(max_w / 612, max_h / 792)
+        expected_zoom = min(max_w / page_w, max_h / page_h)
         assert result.zoom == pytest.approx(expected_zoom)
         assert result.origin == pytest.approx((0.0, 0.0))
-        assert result.image.width == pytest.approx(round(612 * expected_zoom), abs=2)
-        assert result.image.height == pytest.approx(round(792 * expected_zoom), abs=2)
+        # pymupdf's own point->pixel rounding can land 1px off Python's
+        # round() (confirmed empirically: round(612*zoom)=216 but the
+        # real pixmap is 217px wide at this exact zoom) — abs=1 tolerates
+        # that real discrepancy without masking an actual off-by-several
+        # rounding bug.
+        assert result.image.width == pytest.approx(round(page_w * expected_zoom), abs=1)
+        assert result.image.height == pytest.approx(round(page_h * expected_zoom), abs=1)
 
     def test_render_page_raises_entrada_invalida_for_out_of_range_page(
         self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
@@ -1046,6 +1055,24 @@ class TestRenderPage:
         # No raw pymupdf exception escapes: `PDFCorruptoError` is a
         # domain exception, unrelated to pymupdf's exception hierarchy.
         assert not isinstance(exc_info.value, (pymupdf.FileDataError, pymupdf.EmptyFileError))
+
+    @pytest.mark.parametrize(
+        ("max_w", "max_h"),
+        [(0, 280), (260, 0), (-10, 280), (260, -10)],
+    )
+    def test_render_page_raises_entrada_invalida_for_non_positive_box(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path], max_w: int, max_h: int
+    ) -> None:
+        """A Tk widget's winfo_width()/winfo_height() return 0 (or 1)
+        before it's first realized — a real caller-triggerable case, not
+        a hypothetical one, since this method exists to feed a preview
+        widget's image. Zero/negative box dimensions must raise here
+        rather than silently producing a zoom=0.0/0x0 image."""
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.render_page(source, page=1, max_w=max_w, max_h=max_h)
 
 
 class TestHighlightText:
