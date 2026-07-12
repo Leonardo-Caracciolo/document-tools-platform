@@ -456,16 +456,31 @@ class TestEditPanel:
 
     def test_on_source_change_clears_a_stale_click_point(self, tk_root: ctk.CTk) -> None:
         panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._add_page_entry.insert(0, "1")
+        panel._insert_text_entry.insert(0, "hello")
         panel._on_preview_point((123.0, 456.0))
         assert panel._click_point == (123.0, 456.0)
 
+        # A real SourceRow updates its own `_path` before invoking the
+        # on_change callback — mirror that ordering directly.
+        panel._source_row._path = Path("different.pdf")
         panel._on_source_change(Path("different.pdf"))
 
         assert panel._click_point is None
         assert panel._position_menu.get() == panels_module._DEFAULT_POSITION
+        # Close the loop end-to-end, not just on internal state: a stale
+        # point must not survive into collect()'s returned PanelValues.
+        values = panel.collect()
+        assert values.point is None
+        assert values.position == panels_module._DEFAULT_POSITION
 
     def test_page_commit_clears_a_stale_click_point(self, tk_root: ctk.CTk) -> None:
         panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._add_page_entry.insert(0, "1")
+        panel._insert_text_entry.insert(0, "hello")
         panel._on_preview_point((123.0, 456.0))
         assert panel._click_point == (123.0, 456.0)
 
@@ -473,11 +488,18 @@ class TestEditPanel:
 
         assert panel._click_point is None
         assert panel._position_menu.get() == panels_module._DEFAULT_POSITION
+        values = panel.collect()
+        assert values.point is None
+        assert values.position == panels_module._DEFAULT_POSITION
 
     def test_mode_change_away_and_back_clears_a_stale_click_point(
         self, tk_root: ctk.CTk
     ) -> None:
         panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._add_page_entry.insert(0, "1")
+        panel._insert_text_entry.insert(0, "hello")
         panel._on_preview_point((123.0, 456.0))
         assert panel._click_point == (123.0, 456.0)
 
@@ -486,6 +508,9 @@ class TestEditPanel:
 
         assert panel._click_point is None
         assert panel._position_menu.get() == panels_module._DEFAULT_POSITION
+        values = panel.collect()
+        assert values.point is None
+        assert values.position == panels_module._DEFAULT_POSITION
 
     # -- `_refresh_preview` graceful degradation — `sdd/edit-pdf-preview/spec`
     # "Preview Rendering Graceful Degradation" --
