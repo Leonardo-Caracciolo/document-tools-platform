@@ -3,14 +3,19 @@ standalone PySide6 "Advanced Editor" process.
 
 Owns render-box sizing, the `PDFService.render_page` -> `QPixmap` ->
 `QGraphicsScene` pipeline, fit-to-window behavior, in-window error state,
-and (slice 2) click-to-select span hit-testing with a highlight overlay.
-See `sdd/qt-advanced-editor-slice1/design` for the base pipeline rationale
-(D2, D9) and the empirical verification behind `_fit()`'s viewport-size
-guard (V1), and `sdd/qt-advanced-editor-slice2/design` for the click/
-highlight layer (D1-D3, D9) added on top of it.
+click-to-select span hit-testing with a highlight overlay, the
+replace-then-rerender flow, the immutable-original/advancing-working-copy
+state machine, and Save As. See `sdd/qt-advanced-editor-slice1/design` for
+the base pipeline rationale (D2, D9) and the empirical verification behind
+`_fit()`'s viewport-size guard (V1), and `sdd/qt-advanced-editor-slice2/design`
+for the click/highlight layer (D1-D3, D9) and the replace/save/state-machine
+layer (D5-D10) added on top of it.
 
-Slice 2 PR 1 adds click-to-select + highlight only: no editing, no save,
-no IPC to the parent process yet (those land in slice 2 PR 2).
+Slice 2 PR 1 added click-to-select + highlight only. Slice 2 PR 2 (this
+revision) adds the mutation surface: the replacement input + Replace
+button, the replace-then-rerender flow, the working-copy pointer, temp-dir
+lifecycle + `closeEvent` cleanup, and Save As. No IPC to the parent
+process — that remains out of scope for this slice.
 
 `_render`'s in-window error state funnels through the same
 `app.ui.errors.error_message()` resolver the Tkinter surfaces use
@@ -21,6 +26,8 @@ compromise this package's own zero-Tk-at-import-time goal.
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 
 from PIL.ImageQt import ImageQt
@@ -28,11 +35,14 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +51,7 @@ from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError
 from app.core.services.pdf_service import PDFService, SpanInfo
 from app.qt_editor.clickable_page_item import ClickablePageItem
 from app.ui.errors import error_message
+from app.ui.registry import suggest_output_name
 
 _FALLBACK_MAX_W = 1000
 _FALLBACK_MAX_H = 1300
@@ -50,13 +61,17 @@ _SCREEN_FRACTION = 0.9
 
 
 class AdvancedEditorWindow(QMainWindow):
-    """Click-to-select editor window for a single PDF page.
+    """Click-to-select, replace-in-place editor window for a single PDF page.
 
     `pdf_path`/`page` are rendered via the already-shipped
     `PDFService().render_page`. Clicking the rendered page hit-tests a
     text span via `PDFService().find_span_at_point`; a hit is highlighted
-    and its text shown in the side panel's "Selected" label. Replace/Save
-    land in slice 2 PR 2.
+    and its text shown in the side panel's "Selected" label. Typing a
+    replacement and pressing Replace calls `PDFService().replace_text`
+    against the current working copy and re-renders in place; the
+    working-copy pointer only advances once both the write and the
+    re-render succeed (never-corrupt invariant — see `_on_replace`).
+    Save As copies the current working copy to a user-chosen destination.
     """
 
     def __init__(self, pdf_path: Path, page: int) -> None:
@@ -66,6 +81,8 @@ class AdvancedEditorWindow(QMainWindow):
         self._page = page
         self._original_path = pdf_path  # IMMUTABLE — never written
         self._working_path = pdf_path  # first basis IS the original itself (D5)
+        self._temp_dir = Path(tempfile.mkdtemp(prefix="qt_editor_"))  # D7
+        self._edit_seq = 0
         self._zoom = 0.0  # D2, refreshed on every render
         self._origin: tuple[float, float] = (0.0, 0.0)
         self._selected_span: SpanInfo | None = None
@@ -81,10 +98,23 @@ class AdvancedEditorWindow(QMainWindow):
         panel = QWidget(self)
         col = QVBoxLayout(panel)
         self._selected_label = QLabel("Selected: (none)")
+        self._replacement_edit = QLineEdit()
+        self._replace_button = QPushButton("Replace")
+        self._replace_button.setEnabled(False)  # D10: disabled until selection + text
+        self._save_button = QPushButton("Save As…")
         self._feedback = QLabel("")  # D9: dedicated outcome-message surface
-        for w in (self._selected_label, self._feedback):
+        for w in (
+            self._selected_label,
+            self._replacement_edit,
+            self._replace_button,
+            self._save_button,
+            self._feedback,
+        ):
             col.addWidget(w)
         col.addStretch(1)
+        self._replacement_edit.textChanged.connect(self._sync_replace_button)
+        self._replace_button.clicked.connect(self._on_replace)
+        self._save_button.clicked.connect(self._on_save_as)
 
         container = QWidget(self)
         row = QHBoxLayout(container)
@@ -158,6 +188,7 @@ class AdvancedEditorWindow(QMainWindow):
         self._selected_label.setText(f"Selected: {span.text!r}")
         self._draw_highlight(span.bbox)
         self._feedback.setText("")
+        self._sync_replace_button()
 
     def _draw_highlight(self, bbox: tuple[float, float, float, float]) -> None:
         if self._highlight_item is not None:
@@ -174,6 +205,63 @@ class AdvancedEditorWindow(QMainWindow):
         if self._highlight_item is not None:
             self._scene.removeItem(self._highlight_item)
             self._highlight_item = None
+        self._sync_replace_button()
+
+    def _sync_replace_button(self) -> None:
+        """D10: enable Replace only when a span is selected AND the
+        input is non-empty (whitespace-only counts as empty)."""
+        ready = self._selected_span is not None and bool(self._replacement_edit.text().strip())
+        self._replace_button.setEnabled(ready)
+
+    def _next_temp_path(self) -> Path:
+        self._edit_seq += 1
+        return self._temp_dir / f"edit_{self._edit_seq}.pdf"
+
+    def _on_replace(self) -> None:
+        """Replace `self._selected_span` with the input text against the
+        current working copy, then re-render. The working-copy pointer
+        advances ONLY once both the write and the re-render succeed —
+        any failure leaves the pointer, the displayed page, and the
+        selection exactly as they were, with an inline
+        `error_message()`, never a crash (never-corrupt invariant)."""
+        if self._selected_span is None:
+            return  # button is gated (D10); defensive
+        replacement = self._replacement_edit.text()
+        temp_out = self._next_temp_path()
+        try:
+            PDFService().replace_text(
+                self._working_path, temp_out, self._page, self._selected_span, replacement
+            )
+        except (EntradaInvalidaError, PDFCorruptoError) as exc:
+            self._feedback.setText(error_message(exc))
+            return  # NO advance, selection preserved for retry
+        if not self._render(temp_out, terminal_on_error=False):
+            return  # post-write render failed: NO advance, old view intact
+        self._working_path = temp_out  # advance only after a fully visible edit
+        self._clear_selection()  # old SpanInfo is stale after the page changed
+        self._replacement_edit.clear()
+        self._feedback.setText("Replacement applied.")
+
+    def _on_save_as(self) -> None:
+        """D8: always-prompt Save As. Copies the current working copy to
+        the chosen destination; session state is left unchanged so the
+        user may continue editing and save again. Cancel is a no-op."""
+        default_name = suggest_output_name(self._original_path, "_edited", ".pdf")
+        default_path = self._original_path.parent / default_name
+        chosen, _selected_filter = QFileDialog.getSaveFileName(
+            self, "Save As", str(default_path), "PDF files (*.pdf)"
+        )
+        if not chosen:  # cancel -> ('', '') (E3-confirmed), not None
+            return
+        shutil.copyfile(self._working_path, chosen)
+        self._feedback.setText(f"Saved to {Path(chosen).name}")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override naming
+        """D7: wipe this window's temp dir on close. E5-confirmed to
+        fire reliably on `.close()`; superseded edit copies live only
+        here, so nothing else references them once wiped."""
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+        super().closeEvent(event)
 
     def _fit(self) -> None:
         if self._pixmap_item is None:

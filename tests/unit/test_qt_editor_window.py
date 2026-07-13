@@ -1,7 +1,9 @@
 """Tests for `AdvancedEditorWindow` — `sdd/qt-advanced-editor-slice1/design`
-"editor_window.py — render-to-display pipeline" (D2, D9) and
+"editor_window.py — render-to-display pipeline" (D2, D9),
 `sdd/qt-advanced-editor-slice2/design` click-to-select + highlight layer
-(D1-D3, D9; slice 2 PR 1 scope only — no Replace/Save/state-machine yet).
+(D1-D3, D9; slice 2 PR 1), and the replace-then-rerender flow, the
+immutable-original/advancing-working-copy state machine, Save As, and
+temp-dir cleanup (D5-D10; slice 2 PR 2).
 
 Skips cleanly via `importorskip` when PySide6 is absent from the active
 env (it is an optional dependency group — see `pyproject.toml`).
@@ -16,6 +18,7 @@ constructed, which happens in the module-scoped `qapp` fixture below.
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -28,10 +31,10 @@ pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPointF, QSize  # noqa: E402 - must follow importorskip/env setup
-from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel  # noqa: E402
 
 from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError  # noqa: E402
-from app.core.services.pdf_service import PDFService  # noqa: E402
+from app.core.services.pdf_service import PDFService, SpanInfo  # noqa: E402
 from app.qt_editor.clickable_page_item import ClickablePageItem  # noqa: E402
 from app.qt_editor.editor_window import AdvancedEditorWindow  # noqa: E402
 from app.ui.errors import error_message  # noqa: E402
@@ -140,6 +143,23 @@ def _point_to_pixel(window: AdvancedEditorWindow, point: tuple[float, float]) ->
         (point[0] - window._origin[0]) * window._zoom,
         (point[1] - window._origin[1]) * window._zoom,
     )
+
+
+def _click_known_span(
+    window: AdvancedEditorWindow, pdf_path: Path, page: int = 1
+) -> tuple[dict, tuple[float, float]]:
+    """Click `styled_text_pdf_factory`'s known span on `window` and
+    return `(ground_truth_dict, click_point)` for reuse by callers that
+    need to re-derive a nearby point on a since-edited working copy."""
+    doc = pymupdf.open(pdf_path)
+    try:
+        ground_truth = doc.load_page(page - 1).get_text("dict")["blocks"][0]["lines"][0]["spans"][0]
+    finally:
+        doc.close()
+    bbox = ground_truth["bbox"]
+    click_point = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+    window._on_canvas_click(_point_to_pixel(window, click_point))
+    return ground_truth, click_point
 
 
 class TestClickToSelect:
@@ -266,3 +286,271 @@ class TestClearSelection:
         assert window._selected_label.text() == "Selected: (none)"
         assert window._highlight_item is None
         assert highlight_item not in window._scene.items()
+
+
+class TestReplaceFlow:
+    def test_successful_replace_advances_pointer_and_rerenders(
+        self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        window = AdvancedEditorWindow(pdf_path, 1)
+        _click_known_span(window, pdf_path)
+        assert window._selected_span is not None
+        window._replacement_edit.setText("Renamed1")
+
+        window._on_replace()
+
+        assert window._working_path != pdf_path  # pointer advanced (5.1)
+        assert window._working_path.parent == window._temp_dir
+        assert window._working_path.exists()
+        assert window._selected_span is None  # stale selection cleared
+        assert window._selected_label.text() == "Selected: (none)"
+        assert window._replacement_edit.text() == ""
+        assert window._feedback.text() == "Replacement applied."
+        doc = pymupdf.open(window._working_path)
+        try:
+            text = doc.load_page(0).get_text()
+        finally:
+            doc.close()
+        assert "Hello Span" not in text
+        assert "Renamed1" in text
+
+    def test_failed_replace_preserves_prior_state(
+        self,
+        qapp: QApplication,
+        styled_text_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        window = AdvancedEditorWindow(pdf_path, 1)
+        ground_truth, _ = _click_known_span(window, pdf_path)
+        window._replacement_edit.setText("Renamed1")
+        exc = EntradaInvalidaError("boom")
+        monkeypatch.setattr(PDFService, "replace_text", MagicMock(side_effect=exc))
+
+        window._on_replace()  # must not raise
+
+        assert window._working_path == pdf_path  # pointer unchanged (5.2)
+        assert window._selected_span is not None
+        assert window._selected_span.text == ground_truth["text"]
+        assert window._feedback.text() == error_message(exc)
+        assert window._replacement_edit.text() == "Renamed1"  # preserved for retry
+
+    def test_post_write_render_failure_does_not_advance_pointer(
+        self,
+        qapp: QApplication,
+        styled_text_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        # Construction's render uses the real, unpatched method.
+        window = AdvancedEditorWindow(pdf_path, 1)
+        _click_known_span(window, pdf_path)
+        window._replacement_edit.setText("Renamed1")
+        # Patched only AFTER construction: the only call reaching this
+        # fake is the post-replace re-render triggered by `_on_replace`.
+        monkeypatch.setattr(
+            PDFService, "render_page", MagicMock(side_effect=PDFCorruptoError("boom"))
+        )
+
+        window._on_replace()  # must not raise
+
+        assert window._working_path == pdf_path  # NOT advanced (5.3)
+        assert window._selected_span is not None  # early return, before _clear_selection
+
+    def test_second_edit_sources_from_first_edits_output_not_original(
+        self,
+        qapp: QApplication,
+        styled_text_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Covers spec scenarios 'First edit sources from the original'
+        and 'Second edit sources from the first edit's output' as one
+        chained-edit story (5.4, 5.5)."""
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        window = AdvancedEditorWindow(pdf_path, 1)
+        original_replace_text = PDFService.replace_text
+        sources: list[Path] = []
+
+        def spy_replace_text(self, source, output, page, span, replacement):  # noqa: ANN001
+            sources.append(source)
+            return original_replace_text(self, source, output, page, span, replacement)
+
+        monkeypatch.setattr(PDFService, "replace_text", spy_replace_text)
+
+        ground_truth, _ = _click_known_span(window, pdf_path)
+        window._replacement_edit.setText("Renamed1")
+        window._on_replace()
+        first_output = window._working_path
+        assert sources[0] == pdf_path  # 5.4: first edit sources from the original
+        assert first_output != pdf_path
+
+        # Re-select near the same spot on the since-edited working copy —
+        # the replacement starts at the same span origin, so a point near
+        # the bbox's left edge still lands inside the new (possibly
+        # narrower) span regardless of the replacement text's length.
+        bbox = ground_truth["bbox"]
+        near_start = (bbox[0] + 2, (bbox[1] + bbox[3]) / 2)
+        span = PDFService().find_span_at_point(window._working_path, 1, near_start)
+        assert span is not None
+        window._selected_span = span
+        window._sync_replace_button()
+        window._replacement_edit.setText("Renamed2")
+
+        window._on_replace()
+
+        assert sources[1] == first_output  # 5.5: second edit sources from edit 1's output
+        assert sources[1] != pdf_path
+
+    def test_original_file_remains_untouched_after_replacements(
+        self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        original_bytes = pdf_path.read_bytes()
+        window = AdvancedEditorWindow(pdf_path, 1)
+        _click_known_span(window, pdf_path)
+        window._replacement_edit.setText("Renamed1")
+
+        window._on_replace()
+
+        assert pdf_path.read_bytes() == original_bytes  # 5.6
+
+    def test_on_replace_does_not_call_service_when_no_selection(
+        self,
+        qapp: QApplication,
+        valid_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        assert window._selected_span is None
+        mock_replace = MagicMock()
+        monkeypatch.setattr(PDFService, "replace_text", mock_replace)
+
+        window._on_replace()  # must not raise; button is gated, this is defensive (5.8)
+
+        mock_replace.assert_not_called()
+        assert window._working_path == pdf_path
+
+
+class TestSyncReplaceButton:
+    def test_replace_button_enabled_only_with_selection_and_non_empty_input(
+        self, qapp: QApplication, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        dummy_span = SpanInfo(
+            text="x",
+            bbox=(0, 0, 1, 1),
+            origin=(0, 0),
+            font="Helvetica",
+            size=12.0,
+            color=(0, 0, 0),
+        )
+
+        window._selected_span = None
+        window._replacement_edit.setText("")
+        window._sync_replace_button()
+        assert window._replace_button.isEnabled() is False  # no selection, empty input
+
+        window._selected_span = dummy_span
+        window._replacement_edit.setText("")
+        window._sync_replace_button()
+        assert window._replace_button.isEnabled() is False  # selection, empty input
+
+        window._selected_span = None
+        window._replacement_edit.setText("hello")
+        window._sync_replace_button()
+        assert window._replace_button.isEnabled() is False  # no selection, non-empty input
+
+        window._selected_span = dummy_span
+        window._replacement_edit.setText("   ")
+        window._sync_replace_button()
+        assert window._replace_button.isEnabled() is False  # selection, whitespace-only input
+
+        window._selected_span = dummy_span
+        window._replacement_edit.setText("hello")
+        window._sync_replace_button()
+        assert window._replace_button.isEnabled() is True  # selection, non-empty input
+
+
+class TestSaveAs:
+    def test_user_confirms_save_copies_working_copy_to_destination(
+        self,
+        qapp: QApplication,
+        valid_pdf_factory: Callable[..., Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        dest = tmp_path / "chosen_output.pdf"
+        monkeypatch.setattr(
+            QFileDialog,
+            "getSaveFileName",
+            MagicMock(return_value=(str(dest), "PDF files (*.pdf)")),
+        )
+
+        window._on_save_as()
+
+        assert dest.exists()
+        assert dest.read_bytes() == window._working_path.read_bytes()
+        assert window._working_path == pdf_path  # session state unchanged; may keep editing
+        assert "Saved to" in window._feedback.text()
+
+    def test_user_cancels_save_writes_nothing_and_changes_no_state(
+        self,
+        qapp: QApplication,
+        valid_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        monkeypatch.setattr(
+            QFileDialog, "getSaveFileName", MagicMock(return_value=("", ""))
+        )  # E3-confirmed cancel shape
+        mock_copyfile = MagicMock()
+        monkeypatch.setattr(shutil, "copyfile", mock_copyfile)
+
+        window._on_save_as()  # must not raise
+
+        mock_copyfile.assert_not_called()
+        assert window._working_path == pdf_path
+
+    def test_save_with_zero_edits_copies_current_original_content(
+        self,
+        qapp: QApplication,
+        valid_pdf_factory: Callable[..., Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        assert window._working_path == window._original_path  # no replace happened yet
+        dest = tmp_path / "zero_edits_output.pdf"
+        monkeypatch.setattr(
+            QFileDialog,
+            "getSaveFileName",
+            MagicMock(return_value=(str(dest), "PDF files (*.pdf)")),
+        )
+
+        window._on_save_as()
+
+        assert dest.read_bytes() == pdf_path.read_bytes()
+
+
+class TestCloseEventCleanup:
+    def test_close_wipes_temp_dir(
+        self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        window = AdvancedEditorWindow(pdf_path, 1)
+        _click_known_span(window, pdf_path)
+        window._replacement_edit.setText("Renamed1")
+        window._on_replace()
+        assert window._temp_dir.exists()
+        assert any(window._temp_dir.iterdir())
+
+        window.close()
+
+        assert not window._temp_dir.exists()  # 5.12
