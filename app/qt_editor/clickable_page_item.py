@@ -1,12 +1,22 @@
 """`ClickablePageItem` — a `QGraphicsPixmapItem` that forwards left-clicks.
 
-Own module (one concern per module — `sdd/qt-advanced-editor-slice1/design`
-D3 convention). See `sdd/qt-advanced-editor-slice2/design` D1: item-local
-`event.pos()` for a pixmap anchored at scene origin (0,0) is already in
-`PagePreviewResult`'s pixel space, so no extra `mapToScene`/un-fitting step
-is needed. Empirically confirmed (E1) that `QGraphicsPixmapItem` accepts
-`Qt.MouseButton.LeftButton` by default — `setAcceptedMouseButtons` below is
-redundant but kept as explicit, self-documenting intent.
+Its own module because hit-testing is a distinct, reusable concern kept
+separate from the window that owns it — matching this package's
+one-class-per-module convention (`editor_window.py` owns everything
+else).
+
+The click callback receives `event.pos()`, which Qt reports in
+ITEM-LOCAL coordinates. Because this pixmap is always added at scene
+origin (0, 0) with no additional transform, item-local pixels are
+already exactly the pixel space `PagePreviewResult` (and therefore
+`AdvancedEditorWindow._on_canvas_click`'s zoom/origin math) expects — no
+extra `mapToScene()`/un-fitting step is needed here or in the caller.
+
+`setAcceptedMouseButtons(Qt.MouseButton.LeftButton)` below is redundant
+in current PySide6 (a `QGraphicsPixmapItem` accepts left-clicks by
+default — confirmed empirically against real PySide6 6.11.1 runs), but
+is kept as explicit, self-documenting intent in case that default ever
+changes.
 """
 
 from __future__ import annotations

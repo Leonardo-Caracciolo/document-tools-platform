@@ -1,18 +1,17 @@
-"""Tests for `AdvancedEditorWindow` — `sdd/qt-advanced-editor-slice1/design`
-"editor_window.py — render-to-display pipeline" (D2, D9),
-`sdd/qt-advanced-editor-slice2/design` click-to-select + highlight layer
-(D1-D3, D9; slice 2 PR 1), and the replace-then-rerender flow, the
-immutable-original/advancing-working-copy state machine, Save As, and
-temp-dir cleanup (D5-D10; slice 2 PR 2).
+"""Tests for `AdvancedEditorWindow`: the render-to-display pipeline (page
+render, fit-to-window, in-window error state), the click-to-select span
+hit-testing + highlight layer (slice 2 PR 1), and the
+replace-then-rerender flow, the immutable-original/advancing-working-copy
+state machine, Save As, and temp-dir cleanup (slice 2 PR 2).
 
 Skips cleanly via `importorskip` when PySide6 is absent from the active
 env (it is an optional dependency group — see `pyproject.toml`).
 
 Any Qt widget construction requires a real `QApplication`; this module
 runs it under `QT_QPA_PLATFORM=offscreen` so no window is actually
-displayed, matching the design's Testing Strategy note for headless
-runs. The env var must be set BEFORE the first `QApplication` is
-constructed, which happens in the module-scoped `qapp` fixture below.
+displayed, which keeps these tests runnable in headless CI. The env var
+must be set BEFORE the first `QApplication` is constructed, which
+happens in the module-scoped `qapp` fixture below.
 """
 
 from __future__ import annotations
@@ -137,11 +136,14 @@ class TestErrorHandling:
 def _point_to_pixel(window: AdvancedEditorWindow, point: tuple[float, float]) -> QPointF:
     """Forward-map a known PDF point to the item-local pixel `QPointF` a
     click there would produce, using the window's current `_zoom`/
-    `_origin` — the exact inverse of `_on_canvas_click`'s own mapping
-    (`sdd/qt-advanced-editor-slice2/design` D2, E4-confirmed round-trip)."""
+    `_page_origin` — the exact inverse of `_on_canvas_click`'s own
+    pixel-to-point mapping (`point = pixel / zoom + origin`, so
+    `pixel = (point - origin) * zoom`). This inverse was round-trip
+    verified against a real rendered page during design: mapping a known
+    span's bbox to pixels and back landed on the identical span."""
     return QPointF(
-        (point[0] - window._origin[0]) * window._zoom,
-        (point[1] - window._origin[1]) * window._zoom,
+        (point[0] - window._page_origin[0]) * window._zoom,
+        (point[1] - window._page_origin[1]) * window._zoom,
     )
 
 
@@ -171,7 +173,7 @@ class TestClickToSelect:
         window = AdvancedEditorWindow(pdf_path, 1)
 
         assert window._zoom > 0
-        assert window._origin == (0.0, 0.0)
+        assert window._page_origin == (0.0, 0.0)
         assert isinstance(window._pixmap_item, ClickablePageItem)
 
     def test_click_hits_known_span_selects_and_highlights(
@@ -288,6 +290,30 @@ class TestClearSelection:
         assert highlight_item not in window._scene.items()
 
 
+class TestClearFeedback:
+    def test_clear_feedback_resets_label_to_empty(
+        self, qapp: QApplication, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        window._feedback.setText("some prior outcome message")
+
+        window._clear_feedback()
+
+        assert window._feedback.text() == ""
+
+    def test_click_hit_after_a_prior_message_clears_it_via_clear_feedback(
+        self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        window = AdvancedEditorWindow(pdf_path, 1)
+        window._feedback.setText("a stale hint from a prior miss")
+
+        _click_known_span(window, pdf_path)
+
+        assert window._feedback.text() == ""
+
+
 class TestReplaceFlow:
     def test_successful_replace_advances_pointer_and_rerenders(
         self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
@@ -300,7 +326,7 @@ class TestReplaceFlow:
 
         window._on_replace()
 
-        assert window._working_path != pdf_path  # pointer advanced (5.1)
+        assert window._working_path != pdf_path  # pointer advanced to the new edit's output
         assert window._working_path.parent == window._temp_dir
         assert window._working_path.exists()
         assert window._selected_span is None  # stale selection cleared
@@ -330,7 +356,7 @@ class TestReplaceFlow:
 
         window._on_replace()  # must not raise
 
-        assert window._working_path == pdf_path  # pointer unchanged (5.2)
+        assert window._working_path == pdf_path  # pointer must NOT advance when replace_text raises
         assert window._selected_span is not None
         assert window._selected_span.text == ground_truth["text"]
         assert window._feedback.text() == error_message(exc)
@@ -355,7 +381,9 @@ class TestReplaceFlow:
 
         window._on_replace()  # must not raise
 
-        assert window._working_path == pdf_path  # NOT advanced (5.3)
+        # pointer must NOT advance when the post-write re-render fails,
+        # even though the write itself succeeded
+        assert window._working_path == pdf_path
         assert window._selected_span is not None  # early return, before _clear_selection
 
     def test_second_edit_sources_from_first_edits_output_not_original(
@@ -364,9 +392,11 @@ class TestReplaceFlow:
         styled_text_pdf_factory: Callable[..., Path],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Covers spec scenarios 'First edit sources from the original'
-        and 'Second edit sources from the first edit's output' as one
-        chained-edit story (5.4, 5.5)."""
+        """Covers two related scenarios as one chained-edit story: the
+        first edit must source from the original file, and a second edit
+        must source from the first edit's output (not the original) —
+        proving edits chain onto each other rather than each restarting
+        from `pdf_path`."""
         pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
         window = AdvancedEditorWindow(pdf_path, 1)
         original_replace_text = PDFService.replace_text
@@ -382,7 +412,7 @@ class TestReplaceFlow:
         window._replacement_edit.setText("Renamed1")
         window._on_replace()
         first_output = window._working_path
-        assert sources[0] == pdf_path  # 5.4: first edit sources from the original
+        assert sources[0] == pdf_path  # first edit's source is the original file
         assert first_output != pdf_path
 
         # Re-select near the same spot on the since-edited working copy —
@@ -399,7 +429,8 @@ class TestReplaceFlow:
 
         window._on_replace()
 
-        assert sources[1] == first_output  # 5.5: second edit sources from edit 1's output
+        # second edit's source is edit 1's output, not the original
+        assert sources[1] == first_output
         assert sources[1] != pdf_path
 
     def test_original_file_remains_untouched_after_replacements(
@@ -413,7 +444,8 @@ class TestReplaceFlow:
 
         window._on_replace()
 
-        assert pdf_path.read_bytes() == original_bytes  # 5.6
+        # original file must remain byte-for-byte untouched after edits
+        assert pdf_path.read_bytes() == original_bytes
 
     def test_on_replace_does_not_call_service_when_no_selection(
         self,
@@ -427,7 +459,10 @@ class TestReplaceFlow:
         mock_replace = MagicMock()
         monkeypatch.setattr(PDFService, "replace_text", mock_replace)
 
-        window._on_replace()  # must not raise; button is gated, this is defensive (5.8)
+        # must not raise; the Replace button is normally gated by
+        # _sync_replace_button, so this exercises the defensive
+        # early-return when called directly with no selection
+        window._on_replace()
 
         mock_replace.assert_not_called()
         assert window._working_path == pdf_path
@@ -508,7 +543,7 @@ class TestSaveAs:
         window = AdvancedEditorWindow(pdf_path, 1)
         monkeypatch.setattr(
             QFileDialog, "getSaveFileName", MagicMock(return_value=("", ""))
-        )  # E3-confirmed cancel shape
+        )  # real getSaveFileName returns ('', '') on cancel, not None — mock matches that shape
         mock_copyfile = MagicMock()
         monkeypatch.setattr(shutil, "copyfile", mock_copyfile)
 
@@ -553,4 +588,6 @@ class TestCloseEventCleanup:
 
         window.close()
 
-        assert not window._temp_dir.exists()  # 5.12
+        # closeEvent must wipe the temp dir so no edit copies are left on
+        # disk after the window closes
+        assert not window._temp_dir.exists()

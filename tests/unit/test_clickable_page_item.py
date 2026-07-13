@@ -1,5 +1,8 @@
-"""Tests for `ClickablePageItem` — `sdd/qt-advanced-editor-slice2/design`
-D1 (E1-confirmed click delivery).
+"""Tests for `ClickablePageItem` — verifies that a left-click on the item
+is forwarded to its `on_click` callback with item-local pixel
+coordinates (confirmed empirically against real PySide6 6.11.1 that
+`QGraphicsPixmapItem` accepts left-clicks without any extra
+`setAcceptedMouseButtons`/`ItemIsSelectable` flag).
 
 Skips cleanly via `importorskip` when PySide6 is absent from the active
 env (it is an optional dependency group — see `pyproject.toml`). Runs

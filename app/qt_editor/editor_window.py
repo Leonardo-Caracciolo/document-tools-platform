@@ -5,11 +5,27 @@ Owns render-box sizing, the `PDFService.render_page` -> `QPixmap` ->
 `QGraphicsScene` pipeline, fit-to-window behavior, in-window error state,
 click-to-select span hit-testing with a highlight overlay, the
 replace-then-rerender flow, the immutable-original/advancing-working-copy
-state machine, and Save As. See `sdd/qt-advanced-editor-slice1/design` for
-the base pipeline rationale (D2, D9) and the empirical verification behind
-`_fit()`'s viewport-size guard (V1), and `sdd/qt-advanced-editor-slice2/design`
-for the click/highlight layer (D1-D3, D9) and the replace/save/state-machine
-layer (D5-D10) added on top of it.
+state machine, and Save As.
+
+Design history (`sdd/qt-advanced-editor-slice1/design`,
+`sdd/qt-advanced-editor-slice2/design`) — summarized here so this module
+stands on its own without that external record:
+- The base render pipeline reuses the already-shipped
+  `PDFService.render_page` verbatim (no new service method) and refreshes
+  `self._zoom`/`self._page_origin` on every render, not just the first, so
+  click-to-PDF-point mapping never drifts after an edit re-renders the
+  page.
+- `_fit()`'s viewport-size guard exists because a spurious `resizeEvent`
+  fires during window construction, before `showEvent`, with a
+  not-yet-realized (near-zero) viewport; fitting against that would
+  compute a garbage scale that gets silently overwritten a moment later
+  by `showEvent`'s own fit — the guard just skips that wasted, misleading
+  call.
+- The click/highlight layer (added in slice 2 PR 1) hit-tests via
+  `ClickablePageItem`'s forwarded click and draws a separate overlay
+  rect rather than redrawing the pixmap, so selection state stays cheap.
+- The replace/save/state-machine layer (added in slice 2 PR 2) is the
+  mutation surface described in the class docstring below.
 
 Slice 2 PR 1 added click-to-select + highlight only. Slice 2 PR 2 (this
 revision) adds the mutation surface: the replacement input + Replace
@@ -80,14 +96,25 @@ class AdvancedEditorWindow(QMainWindow):
         self.setMinimumSize(900, 640)
         self._page = page
         self._original_path = pdf_path  # IMMUTABLE — never written
-        self._working_path = pdf_path  # first basis IS the original itself (D5)
-        self._temp_dir = Path(tempfile.mkdtemp(prefix="qt_editor_"))  # D7
+        # First edit's basis is the original file itself — no upfront copy.
+        # replace_text never mutates its source, so pointing directly at
+        # the original is safe.
+        self._working_path = pdf_path
+        # Each edit gets its own temp file here (see _next_temp_path); the
+        # whole directory is wiped in closeEvent() when the window closes.
+        self._temp_dir = Path(tempfile.mkdtemp(prefix="qt_editor_"))
         self._edit_seq = 0
-        self._zoom = 0.0  # D2, refreshed on every render
-        self._origin: tuple[float, float] = (0.0, 0.0)
+        # Refreshed on every render (initial + every post-replace
+        # re-render) so pixel-to-PDF-point click mapping never uses a
+        # stale scale.
+        self._zoom = 0.0
+        self._page_origin: tuple[float, float] = (0.0, 0.0)
         self._selected_span: SpanInfo | None = None
         self._pixmap_item: ClickablePageItem | None = None
-        self._highlight_item = None  # QGraphicsRectItem | None (D3)
+        # QGraphicsRectItem | None — a separate overlay rect drawn over
+        # the selected span, not part of the pixmap itself, so
+        # selecting/clearing the highlight never requires a re-render.
+        self._highlight_item = None
 
         self._scene = QGraphicsScene(self)
         self._view = QGraphicsView(self._scene, self)
@@ -100,9 +127,14 @@ class AdvancedEditorWindow(QMainWindow):
         self._selected_label = QLabel("Selected: (none)")
         self._replacement_edit = QLineEdit()
         self._replace_button = QPushButton("Replace")
-        self._replace_button.setEnabled(False)  # D10: disabled until selection + text
+        # Disabled until a span is selected AND replacement text is
+        # entered — see _sync_replace_button.
+        self._replace_button.setEnabled(False)
         self._save_button = QPushButton("Save As…")
-        self._feedback = QLabel("")  # D9: dedicated outcome-message surface
+        # Dedicated label for outcome messages (click-miss hint, replace
+        # error/success) — kept separate from _selected_label so the two
+        # concerns never overwrite each other.
+        self._feedback = QLabel("")
         for w in (
             self._selected_label,
             self._replacement_edit,
@@ -153,8 +185,10 @@ class AdvancedEditorWindow(QMainWindow):
             else:
                 self._feedback.setText(error_message(exc))
             return False
-        self._zoom = result.zoom  # D2: refresh EVERY render
-        self._origin = result.origin
+        # Refresh EVERY render — a post-replace re-render must overwrite
+        # stale zoom/origin, or the next click maps to the wrong point.
+        self._zoom = result.zoom
+        self._page_origin = result.origin
         pixmap = QPixmap.fromImage(ImageQt(result.image))
         if self._pixmap_item is None:
             self._pixmap_item = ClickablePageItem(pixmap, on_click=self._on_canvas_click)
@@ -169,8 +203,8 @@ class AdvancedEditorWindow(QMainWindow):
         if self._zoom <= 0:
             return  # nothing rendered yet
         point = (
-            pos.x() / self._zoom + self._origin[0],
-            pos.y() / self._zoom + self._origin[1],
+            pos.x() / self._zoom + self._page_origin[0],
+            pos.y() / self._zoom + self._page_origin[1],
         )
         try:
             span = PDFService().find_span_at_point(self._working_path, self._page, point)
@@ -187,16 +221,16 @@ class AdvancedEditorWindow(QMainWindow):
         self._selected_span = span
         self._selected_label.setText(f"Selected: {span.text!r}")
         self._draw_highlight(span.bbox)
-        self._feedback.setText("")
+        self._clear_feedback()
         self._sync_replace_button()
 
     def _draw_highlight(self, bbox: tuple[float, float, float, float]) -> None:
         if self._highlight_item is not None:
             self._scene.removeItem(self._highlight_item)
-        x0 = (bbox[0] - self._origin[0]) * self._zoom
-        y0 = (bbox[1] - self._origin[1]) * self._zoom
-        x1 = (bbox[2] - self._origin[0]) * self._zoom
-        y1 = (bbox[3] - self._origin[1]) * self._zoom
+        x0 = (bbox[0] - self._page_origin[0]) * self._zoom
+        y0 = (bbox[1] - self._page_origin[1]) * self._zoom
+        x1 = (bbox[2] - self._page_origin[0]) * self._zoom
+        y1 = (bbox[3] - self._page_origin[1]) * self._zoom
         self._highlight_item = self._scene.addRect(x0, y0, x1 - x0, y1 - y0)
 
     def _clear_selection(self) -> None:
@@ -207,9 +241,20 @@ class AdvancedEditorWindow(QMainWindow):
             self._highlight_item = None
         self._sync_replace_button()
 
+    def _clear_feedback(self) -> None:
+        """Reset the outcome-message label to empty.
+
+        Mirrors `_clear_selection()`: a single, obvious place for future
+        handlers to route through whenever a prior outcome message (a
+        click-miss hint, a replace error) is no longer relevant — as
+        opposed to setting a brand-new message, which call sites do
+        directly via `self._feedback.setText(...)`.
+        """
+        self._feedback.setText("")
+
     def _sync_replace_button(self) -> None:
-        """D10: enable Replace only when a span is selected AND the
-        input is non-empty (whitespace-only counts as empty)."""
+        """Enable Replace only when a span is selected AND the input is
+        non-empty (whitespace-only counts as empty)."""
         ready = self._selected_span is not None and bool(self._replacement_edit.text().strip())
         self._replace_button.setEnabled(ready)
 
@@ -225,7 +270,10 @@ class AdvancedEditorWindow(QMainWindow):
         selection exactly as they were, with an inline
         `error_message()`, never a crash (never-corrupt invariant)."""
         if self._selected_span is None:
-            return  # button is gated (D10); defensive
+            # The Replace button is already disabled without a selection
+            # (see _sync_replace_button); this guard is purely defensive
+            # in case _on_replace is ever invoked directly.
+            return
         replacement = self._replacement_edit.text()
         temp_out = self._next_temp_path()
         try:
@@ -243,23 +291,36 @@ class AdvancedEditorWindow(QMainWindow):
         self._feedback.setText("Replacement applied.")
 
     def _on_save_as(self) -> None:
-        """D8: always-prompt Save As. Copies the current working copy to
-        the chosen destination; session state is left unchanged so the
-        user may continue editing and save again. Cancel is a no-op."""
+        """Always-prompt Save As.
+
+        There is no separate document path to overwrite (the original is
+        immutable), so Save and Save As collapse into one dialog that
+        always asks for a destination. Copies the current working copy
+        to the chosen destination; session state is left unchanged so
+        the user may continue editing and save again. Cancel is a
+        no-op."""
         default_name = suggest_output_name(self._original_path, "_edited", ".pdf")
         default_path = self._original_path.parent / default_name
         chosen, _selected_filter = QFileDialog.getSaveFileName(
             self, "Save As", str(default_path), "PDF files (*.pdf)"
         )
-        if not chosen:  # cancel -> ('', '') (E3-confirmed), not None
+        # Qt's getSaveFileName returns a 2-tuple; on cancel both elements
+        # are empty strings ('', ''), never None, so this falsy check is
+        # sufficient.
+        if not chosen:
             return
         shutil.copyfile(self._working_path, chosen)
         self._feedback.setText(f"Saved to {Path(chosen).name}")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override naming
-        """D7: wipe this window's temp dir on close. E5-confirmed to
-        fire reliably on `.close()`; superseded edit copies live only
-        here, so nothing else references them once wiped."""
+        """Wipe this window's temp dir on close.
+
+        Superseded edit copies (from earlier replacements) live only in
+        `self._temp_dir` and are never referenced again once the window
+        closes — there is no undo feature that would need them. Qt
+        reliably calls `closeEvent` on `.close()`, so this is a safe,
+        deterministic place to clean up rather than relying on
+        process-exit or `__del__` timing."""
         shutil.rmtree(self._temp_dir, ignore_errors=True)
         super().closeEvent(event)
 
@@ -268,7 +329,7 @@ class AdvancedEditorWindow(QMainWindow):
             return
         vp = self._view.viewport().size()
         if vp.width() <= 0 or vp.height() <= 0:
-            # V1: a spurious resizeEvent fires during window construction,
+            # A spurious resizeEvent fires during window construction,
             # before showEvent, with a not-yet-realized viewport. Skip the
             # wasted fitInView call; showEvent's own fit supersedes it.
             return
