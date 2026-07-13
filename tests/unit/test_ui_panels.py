@@ -36,7 +36,7 @@ import pytest
 from PIL import Image
 
 from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError
-from app.core.services.pdf_service import PagePreviewResult
+from app.core.services.pdf_service import PagePreviewResult, SpanInfo
 from app.ui.registry import SecretField
 from app.ui.widgets import panels as panels_module
 from app.ui.widgets.panels import (
@@ -47,6 +47,20 @@ from app.ui.widgets.panels import (
     SingleInDirOutPanel,
     SingleInSingleOutPanel,
 )
+
+
+def _make_span(
+    text: str = "Hello",
+    bbox: tuple[float, float, float, float] = (10.0, 10.0, 50.0, 20.0),
+) -> SpanInfo:
+    return SpanInfo(
+        text=text,
+        bbox=bbox,
+        origin=(10.0, 18.0),
+        font="Helvetica",
+        size=11.0,
+        color=(0.0, 0.0, 0.0),
+    )
 
 
 class TestSingleInSingleOutPanel:
@@ -596,3 +610,250 @@ class TestEditPanel:
         mock_cls.return_value.render_page.assert_called_once_with(
             Path("in.pdf"), 2, panels_module._PREVIEW_MAX_W, panels_module._PREVIEW_MAX_H
         )
+
+
+class TestEditPanelReplaceMode:
+    """`sdd/edit-pdf-replace-text/spec` — "Replace-Mode Field Visibility and
+    Local Guard", "Visual Selection Overlay", "Empty-Space Click Graceful
+    Degradation", "_selected_span Invalidation".
+    """
+
+    # -- mode visibility --
+
+    def test_on_mode_change_to_replace_text_shows_only_replace_group_fields(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+
+        panel._on_mode_change("Replace text")
+
+        assert panel._mode == "replace_text"
+        assert panel._replace_page_entry.grid_info() != {}
+        assert panel._replacement_entry.grid_info() != {}
+        assert panel._selection_feedback.grid_info() != {}
+        assert panel._add_page_entry.grid_info() == {}
+        assert panel._insert_text_entry.grid_info() == {}
+        assert panel._position_menu.grid_info() == {}
+        assert panel._search_query_entry.grid_info() == {}
+        assert panel._search_page_entry.grid_info() == {}
+
+    def test_on_mode_change_away_from_replace_text_hides_replace_group(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+
+        panel._on_mode_change("Add text")
+
+        assert panel._replace_page_entry.grid_info() == {}
+        assert panel._replacement_entry.grid_info() == {}
+        assert panel._selection_feedback.grid_info() == {}
+
+    # -- collect() guard --
+
+    def test_collect_raises_without_selected_span_and_makes_no_service_call(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = MagicMock(name="PDFService")
+        monkeypatch.setattr(panels_module, "PDFService", mock_cls)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._replace_page_entry.insert(0, "1")
+        panel._replacement_entry.insert(0, "new text")
+        # _selected_span intentionally left None
+
+        with pytest.raises(EntradaInvalidaError):
+            panel.collect()
+
+        mock_cls.return_value.replace_text.assert_not_called()
+
+    def test_collect_raises_on_blank_replacement(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._replace_page_entry.insert(0, "1")
+        panel._selected_span = _make_span()
+        # replacement entry intentionally left blank
+
+        with pytest.raises(EntradaInvalidaError):
+            panel.collect()
+
+    def test_collect_returns_panel_values_when_span_and_replacement_set(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._replace_page_entry.insert(0, "2")
+        panel._replacement_entry.insert(0, "new text")
+        span = _make_span()
+        panel._selected_span = span
+
+        values = panel.collect()
+
+        assert values.mode == "replace_text"
+        assert values.source == Path("in.pdf")
+        assert values.output == Path("out.pdf")
+        assert values.page == 2
+        assert values.selected_span is span
+        assert values.replacement == "new text"
+
+    # -- `_on_preview_point` --
+
+    def test_on_preview_point_add_text_mode_also_marks_point(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._preview.mark_point = MagicMock()
+
+        panel._on_preview_point((5.0, 5.0))
+
+        panel._preview.mark_point.assert_called_once_with((5.0, 5.0))
+
+    def test_on_preview_point_hit_sets_span_marks_and_feedback(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        span = _make_span(text="Hello Span")
+        mock_cls = MagicMock(name="PDFService")
+        mock_cls.return_value.find_span_at_point.return_value = span
+        monkeypatch.setattr(panels_module, "PDFService", mock_cls)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._replace_page_entry.insert(0, "1")
+        panel._preview.mark_span = MagicMock()
+
+        panel._on_preview_point((15.0, 15.0))
+
+        assert panel._selected_span is span
+        panel._preview.mark_span.assert_called_once_with(span.bbox)
+        assert panel._selection_feedback.cget("text") == "Selected: 'Hello Span'"
+        mock_cls.return_value.find_span_at_point.assert_called_once_with(
+            Path("in.pdf"), 1, (15.0, 15.0)
+        )
+
+    def test_on_preview_point_miss_clears_span_and_shows_message(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = MagicMock(name="PDFService")
+        mock_cls.return_value.find_span_at_point.return_value = None
+        monkeypatch.setattr(panels_module, "PDFService", mock_cls)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._replace_page_entry.insert(0, "1")
+        panel._selected_span = _make_span()
+        panel._preview.clear_marks = MagicMock()
+
+        panel._on_preview_point((500.0, 700.0))
+
+        assert panel._selected_span is None
+        panel._preview.clear_marks.assert_called_once()
+        assert panel._selection_feedback.cget("text") == panels_module._NO_SPAN_AT_CLICK_MESSAGE
+
+    def test_on_preview_point_no_source_shows_message_without_crash(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._replace_page_entry.insert(0, "1")
+        # source intentionally left unset
+
+        panel._on_preview_point((10.0, 10.0))  # must not raise
+
+        assert panel._selected_span is None
+        assert panel._selection_feedback.cget("text") == panels_module._NO_SPAN_AT_CLICK_MESSAGE
+
+    def test_on_preview_point_invalid_page_shows_message_without_crash(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        # page entry intentionally left blank -> invalid for replace mode
+
+        panel._on_preview_point((10.0, 10.0))  # must not raise
+
+        assert panel._selected_span is None
+        assert panel._selection_feedback.cget("text") == panels_module._NO_SPAN_AT_CLICK_MESSAGE
+
+    def test_on_preview_point_translates_pdf_corrupto_to_inline_message(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = MagicMock(name="PDFService")
+        mock_cls.return_value.find_span_at_point.side_effect = PDFCorruptoError("corrupt")
+        monkeypatch.setattr(panels_module, "PDFService", mock_cls)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._replace_page_entry.insert(0, "1")
+
+        panel._on_preview_point((10.0, 10.0))  # must not raise
+
+        assert panel._selected_span is None
+        assert panel._selection_feedback.cget("text") == panels_module._NO_SPAN_AT_CLICK_MESSAGE
+
+    # -- `_selected_span` invalidation on source/page/mode change — direct
+    # template: `TestEditPanel`'s existing `_click_point` invalidation
+    # tests above (`test_on_source_change_clears_a_stale_click_point`,
+    # `test_page_commit_clears_a_stale_click_point`,
+    # `test_mode_change_away_and_back_clears_a_stale_click_point`).
+    # Asserted through `collect()`'s actual return value, not just
+    # internal state — the same directness gap a follow-up commit had to
+    # fix after `edit-pdf-preview`'s own verify pass.
+
+    def test_on_source_change_clears_a_stale_selected_span(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._replace_page_entry.insert(0, "1")
+        panel._replacement_entry.insert(0, "new text")
+        panel._selected_span = _make_span()
+        assert panel._selected_span is not None
+
+        panel._source_row._path = Path("different.pdf")
+        panel._on_source_change(Path("different.pdf"))
+
+        assert panel._selected_span is None
+        assert panel._selection_feedback.cget("text") == ""
+        with pytest.raises(EntradaInvalidaError):
+            panel.collect()
+
+    def test_page_commit_clears_a_stale_selected_span(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._replace_page_entry.insert(0, "1")
+        panel._replacement_entry.insert(0, "new text")
+        panel._selected_span = _make_span()
+        assert panel._selected_span is not None
+
+        panel._refresh_preview_evt(event=None)
+
+        assert panel._selected_span is None
+        assert panel._selection_feedback.cget("text") == ""
+        with pytest.raises(EntradaInvalidaError):
+            panel.collect()
+
+    def test_mode_change_away_and_back_clears_a_stale_selected_span(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._save_as_row._output = Path("out.pdf")
+        panel._replace_page_entry.insert(0, "1")
+        panel._replacement_entry.insert(0, "new text")
+        panel._selected_span = _make_span()
+        assert panel._selected_span is not None
+
+        panel._on_mode_change("Add text")
+        panel._on_mode_change("Replace text")
+
+        assert panel._selected_span is None
+        assert panel._selection_feedback.cget("text") == ""
+        with pytest.raises(EntradaInvalidaError):
+            panel.collect()

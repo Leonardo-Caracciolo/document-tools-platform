@@ -18,6 +18,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import customtkinter as ctk
+import pytest
 from PIL import Image
 
 from app.core.services.pdf_service import PagePreviewResult
@@ -140,3 +141,103 @@ class TestClick:
         _click(widget, x=10, y=10)
 
         on_point.assert_not_called()
+
+
+class TestToPx:
+    def test_to_px_round_trips_against_on_click_forward_math(self, tk_root: ctk.CTk) -> None:
+        # Same zoom/origin as `TestClick.test_click_after_show_computes_point_and_calls_on_point`
+        # — `_to_px` is the exact inverse of `_on_click`'s forward formula.
+        on_point = MagicMock()
+        widget = PdfPagePreview(tk_root, on_point=on_point)
+        widget.show(_make_result(zoom=0.5, origin=(10.0, 20.0)))
+
+        _click(widget, x=40, y=60)
+
+        (point,) = on_point.call_args.args
+        assert widget._to_px(*point) == pytest.approx((40.0, 60.0))
+
+    def test_to_px_with_different_zoom_and_origin(self, tk_root: ctk.CTk) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+        widget.show(_make_result(zoom=0.25, origin=(3.0, 4.0)))
+
+        pdf_point = (8 / 0.25 + 3.0, 8 / 0.25 + 4.0)
+
+        assert widget._to_px(*pdf_point) == pytest.approx((8.0, 8.0))
+
+
+class TestOverlay:
+    def test_mark_point_draws_on_a_copy_leaving_base_image_untouched(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+        widget.show(_make_result(zoom=1.0, origin=(0.0, 0.0)))
+        base_before = widget._base_image.copy()
+
+        widget.mark_point((10.0, 10.0))
+
+        assert widget._base_image is not None
+        assert widget._base_image.tobytes() == base_before.tobytes()
+        assert widget._ctk_image is not None
+
+    def test_mark_span_draws_a_rectangle(self, tk_root: ctk.CTk) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+        widget.show(_make_result(zoom=1.0, origin=(0.0, 0.0)))
+        base_before = widget._base_image.copy()
+
+        widget.mark_span((5.0, 5.0, 50.0, 50.0))
+
+        assert widget._base_image.tobytes() == base_before.tobytes()
+        assert widget._ctk_image is not None
+
+    def test_repeated_mark_calls_do_not_accumulate_overlays(self, tk_root: ctk.CTk) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+        widget.show(_make_result(zoom=1.0, origin=(0.0, 0.0)))
+
+        widget.mark_point((10.0, 10.0))
+        first_ctk_image = widget._ctk_image
+        widget.mark_span((5.0, 5.0, 50.0, 50.0))
+
+        # A second overlay call rebuilds from the pristine base again — the
+        # displayed image is a fresh `CTkImage`, not a compounded one, and
+        # `_base_image` itself never gained any drawing.
+        assert widget._ctk_image is not first_ctk_image
+        assert widget._base_image is not None
+
+    def test_clear_marks_restores_pristine_base_with_no_drawing(self, tk_root: ctk.CTk) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+        widget.show(_make_result(zoom=1.0, origin=(0.0, 0.0)))
+        base_before = widget._base_image.copy()
+        widget.mark_span((5.0, 5.0, 50.0, 50.0))
+
+        widget.clear_marks()
+
+        assert widget._ctk_image is not None
+        assert widget._base_image.tobytes() == base_before.tobytes()
+
+    def test_mark_point_before_any_show_is_a_guarded_no_op(self, tk_root: ctk.CTk) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+
+        widget.mark_point((1.0, 1.0))  # must not raise
+
+        assert widget._ctk_image is None
+        assert widget._base_image is None
+
+    def test_mark_span_after_placeholder_is_a_guarded_no_op(self, tk_root: ctk.CTk) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+        widget.show(_make_result())
+        widget.show_placeholder()
+
+        widget.mark_span((0.0, 0.0, 10.0, 10.0))  # must not raise
+
+        assert widget._ctk_image is None
+        assert widget._base_image is None
+
+    def test_clear_marks_after_placeholder_is_a_guarded_no_op(self, tk_root: ctk.CTk) -> None:
+        widget = PdfPagePreview(tk_root, on_point=MagicMock())
+        widget.show(_make_result())
+        widget.show_placeholder()
+
+        widget.clear_marks()  # must not raise
+
+        assert widget._ctk_image is None
+        assert widget._base_image is None

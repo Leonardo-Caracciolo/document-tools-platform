@@ -22,7 +22,7 @@ from pathlib import Path
 import customtkinter as ctk
 
 from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError
-from app.core.services.pdf_service import PDFService
+from app.core.services.pdf_service import PDFService, SpanInfo
 from app.ui.registry import PanelValues, SecretField
 from app.ui.widgets.pdf_page_preview import PdfPagePreview
 from app.ui.widgets.rows import (
@@ -261,6 +261,7 @@ _MODE_BY_LABEL: dict[str, str] = {
     "Add text": "add_text",
     "Highlight text": "highlight_text",
     "Redact text": "redact_text",
+    "Replace text": "replace_text",
 }
 _MODE_LABELS: tuple[str, ...] = tuple(_MODE_BY_LABEL)
 _DEFAULT_MODE_LABEL = "Add text"
@@ -277,6 +278,9 @@ _DEFAULT_POSITION = "top-left"
 _EMPTY_INSERT_TEXT_MESSAGE = "Enter the text to insert before running."
 _EMPTY_SEARCH_QUERY_MESSAGE = "Enter the text to search for before running."
 _INVALID_PAGE_MESSAGE = "Enter a valid page number (1 or greater)."
+_EMPTY_REPLACEMENT_TEXT_MESSAGE = "Enter the replacement text before running."
+_NO_SPAN_SELECTED_MESSAGE = "Click a word in the preview to select the text to replace."
+_NO_SPAN_AT_CLICK_MESSAGE = "No text found here — click a word to select."
 
 #: Display label the position dropdown shows once a preview click has
 #: stored a point — never one of `_POSITION_PRESETS`, but `CTkOptionMenu`
@@ -296,8 +300,8 @@ _PREVIEW_MAX_H = 650
 class EditPanel(InputPanel):
     """Family F — mode-selector single-in/single-out panel (edit_pdf).
 
-    Add text / Highlight text / Redact text share one `SourceRow` +
-    `SaveAsRow` shell behind an internal mode `CTkOptionMenu`
+    Add text / Highlight text / Redact text / Replace text share one
+    `SourceRow` + `SaveAsRow` shell behind an internal mode `CTkOptionMenu`
     (`sdd/edit-pdf/design` "UI Design" §`EditPanel`). `_on_mode_change`
     `grid_forget()`s the inactive mode's field group and `grid()`s the
     active one at its fixed rows — empty grid rows collapse to zero
@@ -322,6 +326,7 @@ class EditPanel(InputPanel):
         super().__init__(master)
         self._mode: str = _MODE_BY_LABEL[_DEFAULT_MODE_LABEL]
         self._click_point: tuple[float, float] | None = None
+        self._selected_span: SpanInfo | None = None
         self._save_as_row = SaveAsRow(self, output_suffix, output_ext)
         self._source_row = SourceRow(self, on_change=self._on_source_change)
 
@@ -359,11 +364,29 @@ class EditPanel(InputPanel):
             (self._search_page_label, self._search_page_entry),
         )
 
+        # REPLACE group (rows 2-3) — click-to-select, own page entry
+        # (distinct from `_add_page_entry`), no query entry, no position
+        # dropdown (position is derived from the selected span).
+        self._replace_page_label = ctk.CTkLabel(self, text="Page (1-based)")
+        self._replace_page_entry = ctk.CTkEntry(self)
+        self._replace_page_entry.bind("<FocusOut>", self._refresh_preview_evt)
+        self._replace_page_entry.bind("<Return>", self._refresh_preview_evt)
+        self._replacement_label = ctk.CTkLabel(self, text="Replacement text")
+        self._replacement_entry = ctk.CTkEntry(self)
+        self._replace_group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...] = (
+            (self._replace_page_label, self._replace_page_entry),
+            (self._replacement_label, self._replacement_entry),
+        )
+        #: Panel-local inline hint for the replace-mode click outcome —
+        #: distinct from `ToolView.status_label`, which is the Run-outcome
+        #: surface (design D5).
+        self._selection_feedback = ctk.CTkLabel(self, text="")
+
         self._source_row.grid(row=0, column=0, columnspan=2, sticky="ew")
         self._mode_menu.grid(row=1, column=0, columnspan=2, sticky="w")
         self._grid_group(self._add_group)  # default mode = add_text
         self._preview.grid(row=5, column=0, columnspan=2, sticky="ew")
-        self._save_as_row.grid(row=6, column=0, columnspan=2, sticky="ew")
+        self._save_as_row.grid(row=7, column=0, columnspan=2, sticky="ew")
 
     @staticmethod
     def _grid_group(group: tuple[tuple[ctk.CTkBaseClass, ctk.CTkBaseClass], ...]) -> None:
@@ -385,13 +408,20 @@ class EditPanel(InputPanel):
         class docstring) — tests must call this method directly.
         """
         self._clear_click_point()
+        self._clear_selection()
         self._forget_group(self._add_group)
         self._forget_group(self._search_group)
+        self._forget_group(self._replace_group)
+        self._selection_feedback.grid_forget()
         self._preview.grid_forget()
         self._mode = _MODE_BY_LABEL[value]
         if self._mode == "add_text":
             self._grid_group(self._add_group)
             self._preview.grid(row=5, column=0, columnspan=2, sticky="ew")
+        elif self._mode == "replace_text":
+            self._grid_group(self._replace_group)
+            self._preview.grid(row=5, column=0, columnspan=2, sticky="ew")
+            self._selection_feedback.grid(row=6, column=0, columnspan=2, sticky="w")
         else:
             self._grid_group(self._search_group)
 
@@ -415,6 +445,22 @@ class EditPanel(InputPanel):
         self._click_point = None
         self._position_menu.set(_DEFAULT_POSITION)
 
+    def _clear_selection(self) -> None:
+        """Reset any stored replace-mode span selection and its overlay.
+
+        Mirrors `_clear_click_point()` exactly, for the same reason: a
+        stored `_selected_span` pertains to whichever page/document was
+        rendered at the moment of the click, so every event that can
+        invalidate that render (a new source file, a different page
+        number, or leaving `replace_text` mode and coming back) MUST
+        clear it too — the exact review-caught bug class documented on
+        `_clear_click_point`, now guarded against for the replace-mode
+        selection as well.
+        """
+        self._selected_span = None
+        self._selection_feedback.configure(text="")
+        self._preview.clear_marks()
+
     def _on_source_change(self, path: Path | None) -> None:
         """`SourceRow.on_change` fan-out target.
 
@@ -422,21 +468,58 @@ class EditPanel(InputPanel):
         both `SaveAsRow.set_source` (its original target) and a preview
         refresh (`sdd/edit-pdf-preview/design` D3), without changing
         `SourceRow`'s shared single-callback signature. Clears any
-        stored click point first — see `_clear_click_point`.
+        stored click point/selection first — see `_clear_click_point`/
+        `_clear_selection`.
         """
         self._clear_click_point()
+        self._clear_selection()
         self._save_as_row.set_source(path)
         self._refresh_preview()
 
     def _on_preview_point(self, point: tuple[float, float]) -> None:
         """`PdfPagePreview.on_point` callback — a click stores the point.
 
-        Sets the position dropdown's DISPLAY to a non-preset label; the
-        source of truth for `collect()` is `_click_point`, never this
-        string (`sdd/edit-pdf-preview/design` D4).
+        Branches on `self._mode`. In `add_text` mode, sets the position
+        dropdown's DISPLAY to a non-preset label; the source of truth for
+        `collect()` is `_click_point`, never this string
+        (`sdd/edit-pdf-preview/design` D4) — and ALSO draws a marker at
+        the click point. In `replace_text` mode, resolves the clicked
+        point to a `SpanInfo` via `PDFService.find_span_at_point`: a hit
+        stores the span, draws a selection box, and shows the selected
+        text; a miss (or a local resolution error) clears the selection
+        and shows a non-blocking inline message — never a crash, never
+        silent (spec "Empty-Space Click Graceful Degradation").
         """
-        self._click_point = point
-        self._position_menu.set(_CLICKED_POSITION_LABEL)
+        if self._mode == "add_text":
+            self._click_point = point
+            self._position_menu.set(_CLICKED_POSITION_LABEL)
+            self._preview.mark_point(point)
+            return
+
+        if self._mode != "replace_text":
+            return
+
+        try:
+            source = self._source_row.path
+            page = self._parse_page(self._replace_page_entry.get())
+            if source is None:
+                raise EntradaInvalidaError(_SELECT_SOURCE_AND_OUTPUT)
+            span = PDFService().find_span_at_point(source, page, point)
+        except (EntradaInvalidaError, PDFCorruptoError):
+            self._selected_span = None
+            self._preview.clear_marks()
+            self._selection_feedback.configure(text=_NO_SPAN_AT_CLICK_MESSAGE)
+            return
+
+        if span is None:
+            self._selected_span = None
+            self._preview.clear_marks()
+            self._selection_feedback.configure(text=_NO_SPAN_AT_CLICK_MESSAGE)
+            return
+
+        self._selected_span = span
+        self._preview.mark_span(span.bbox)
+        self._selection_feedback.configure(text=f"Selected: {span.text!r}")
 
     def _on_position_select(self, value: str) -> None:
         """`command=` target for `_position_menu` — clears any stored click point.
@@ -452,24 +535,38 @@ class EditPanel(InputPanel):
         del value
         self._click_point = None
 
+    def _active_page_entry(self) -> ctk.CTkEntry:
+        """Return whichever group's page entry is live for `self._mode`.
+
+        `add_text` and `replace_text` each own a distinct page entry
+        (`_add_page_entry`/`_replace_page_entry`) — the preview render
+        and any subsequent `find_span_at_point` call must always agree
+        on which page is showing, so both `_refresh_preview` and
+        `_on_preview_point` resolve the page through this single helper.
+        """
+        if self._mode == "replace_text":
+            return self._replace_page_entry
+        return self._add_page_entry
+
     def _refresh_preview(self) -> None:
         """Re-render the preview, or show a neutral placeholder.
 
         Graceful degradation only (`sdd/edit-pdf-preview/spec` "Preview
         Rendering Graceful Degradation") — this method never raises and
         never blocks `Run`; full validation stays `collect()`'s and the
-        service's job. Does NOT clear `_click_point` itself — callers
-        that can genuinely invalidate a stored point (`_on_source_change`,
-        `_refresh_preview_evt`) call `_clear_click_point()` themselves
-        before refreshing, so this method stays a pure render/placeholder
-        step reusable without that side effect.
+        service's job. Does NOT clear `_click_point`/`_selected_span`
+        itself — callers that can genuinely invalidate a stored point/
+        selection (`_on_source_change`, `_refresh_preview_evt`) call
+        `_clear_click_point()`/`_clear_selection()` themselves before
+        refreshing, so this method stays a pure render/placeholder step
+        reusable without that side effect.
         """
         source = self._source_row.path
         if source is None:
             self._preview.show_placeholder()
             return
         try:
-            page = self._parse_page(self._add_page_entry.get())
+            page = self._parse_page(self._active_page_entry().get())
             result = PDFService().render_page(source, page, _PREVIEW_MAX_W, _PREVIEW_MAX_H)
         except (EntradaInvalidaError, PDFCorruptoError):
             self._preview.show_placeholder()
@@ -480,11 +577,13 @@ class EditPanel(InputPanel):
         """`<FocusOut>`/`<Return>` bind wrapper for the page-number entry.
 
         A page-number change can point the preview at a different page
-        of the same document, invalidating any stored click — clears it
-        (see `_clear_click_point`) before re-rendering.
+        of the same document, invalidating any stored click/selection —
+        clears both (see `_clear_click_point`/`_clear_selection`) before
+        re-rendering.
         """
         del event
         self._clear_click_point()
+        self._clear_selection()
         self._refresh_preview()
 
     def collect(self) -> PanelValues:
@@ -515,6 +614,22 @@ class EditPanel(InputPanel):
                 page=page,
                 insert_text=insert_text,
                 position=position,
+            )
+
+        if self._mode == "replace_text":
+            page = self._parse_page(self._replace_page_entry.get())
+            replacement = self._replacement_entry.get()
+            if not replacement.strip():
+                raise EntradaInvalidaError(_EMPTY_REPLACEMENT_TEXT_MESSAGE)
+            if self._selected_span is None:
+                raise EntradaInvalidaError(_NO_SPAN_SELECTED_MESSAGE)
+            return PanelValues(
+                mode="replace_text",
+                source=source,
+                output=output,
+                page=page,
+                selected_span=self._selected_span,
+                replacement=replacement,
             )
 
         search_query = self._search_query_entry.get()

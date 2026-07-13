@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.core.services.pdf_service import SpanInfo
 from app.ui import registry as registry_module
 from app.ui.registry import (
     SPEC_BY_ID,
@@ -100,6 +101,14 @@ class TestToolSpecsShape:
         for spec in TOOL_SPECS:
             if spec.tool_id not in {"protect", "unlock"}:
                 assert spec.secret_fields == ()
+
+
+class TestPanelValuesDefaults:
+    def test_selected_span_and_replacement_default_to_none(self) -> None:
+        values = PanelValues()
+
+        assert values.selected_span is None
+        assert values.replacement is None
 
 
 class TestRunWiring:
@@ -355,6 +364,35 @@ class TestRunWiring:
 
         mock_cls.return_value.redact_text.assert_called_once_with(
             source, output, "confidential", 3
+        )
+
+    def test_edit_pdf_replace_text_mode_calls_pdf_service_replace_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cls = self._patch_service(monkeypatch, "PDFService")
+        source = Path("in.pdf")
+        output = Path("out.pdf")
+        span = SpanInfo(
+            text="Hello",
+            bbox=(10.0, 10.0, 50.0, 20.0),
+            origin=(10.0, 18.0),
+            font="Helvetica",
+            size=11.0,
+            color=(0.0, 0.0, 0.0),
+        )
+        values = PanelValues(
+            mode="replace_text",
+            source=source,
+            output=output,
+            page=2,
+            selected_span=span,
+            replacement="new text",
+        )
+
+        SPEC_BY_ID["edit_pdf"].run(values)
+
+        mock_cls.return_value.replace_text.assert_called_once_with(
+            source, output, 2, span, "new text"
         )
 
     def test_all_13_tool_ids_have_wiring_coverage(self) -> None:

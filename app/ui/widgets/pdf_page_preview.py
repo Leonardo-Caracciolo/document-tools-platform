@@ -20,10 +20,17 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw
 
 from app.core.services.pdf_service import PagePreviewResult
 
 _DEFAULT_PLACEHOLDER_MESSAGE = "No preview"
+
+#: Half-width (px) of the crosshair drawn by `mark_point` and the outline
+#: width (px) used by `mark_span`'s rectangle — both purely cosmetic.
+_MARKER_RADIUS = 5
+_MARK_COLOR = "red"
+_MARK_WIDTH = 2
 
 
 class PdfPagePreview(ctk.CTkFrame):
@@ -45,6 +52,12 @@ class PdfPagePreview(ctk.CTkFrame):
         self._zoom: float = 0.0
         self._origin: tuple[float, float] = (0.0, 0.0)
         self._ctk_image: ctk.CTkImage | None = None
+        #: Raw undecorated PIL image from the last `show()` call, kept
+        #: SEPARATE from `self._ctk_image` (the currently displayed
+        #: image, which may carry an overlay) so `mark_point`/`mark_span`
+        #: always start drawing from a pristine copy — overlays never
+        #: accumulate on top of each other.
+        self._base_image: Image.Image | None = None
 
         self._label = ctk.CTkLabel(self, text="", image=None)
         self._label.grid(row=0, column=0, sticky="nsew")
@@ -62,6 +75,7 @@ class PdfPagePreview(ctk.CTkFrame):
         self._label.configure(image=self._ctk_image, text="")
         self._zoom = result.zoom
         self._origin = result.origin
+        self._base_image = result.image
 
     def show_placeholder(self, message: str = _DEFAULT_PLACEHOLDER_MESSAGE) -> None:
         """Clear the image and show `message` instead.
@@ -89,6 +103,10 @@ class PdfPagePreview(ctk.CTkFrame):
         self._label.configure(image=None, text=message)
         self._ctk_image = None
         self._zoom = 0.0
+        # Also drop the retained base image so a mark_point/mark_span/
+        # clear_marks call after a placeholder is a guarded no-op (same
+        # discipline as `_on_click`'s existing `_ctk_image`/`_zoom` reset).
+        self._base_image = None
 
     def _on_click(self, event: object) -> None:
         """`<Button-1>` handler bound on `self._label._label`.
@@ -105,3 +123,69 @@ class PdfPagePreview(ctk.CTkFrame):
             event.y / self._zoom + self._origin[1],
         )
         self._on_point(point)
+
+    def _render_overlay(self, draw_fn: Callable[[ImageDraw.ImageDraw], None]) -> None:
+        """Draw on a fresh copy of `self._base_image` and display it.
+
+        Guarded no-op when there is nothing rendered yet (`_base_image is
+        None`, mirroring `_on_click`'s guard) or `_zoom` is non-positive
+        (set by `show_placeholder`). ALWAYS copies from the pristine
+        `_base_image` — never from the currently displayed
+        `self._ctk_image` — so repeated overlay calls never accumulate on
+        top of each other. The final `configure(image=self._ctk_image,
+        ...)` call always passes a non-`None` image, which avoids the
+        `configure(image=None)` dangling-Tcl-image gotcha documented on
+        `show_placeholder` (that gotcha is specific to the `image=None`
+        path, not this non-`None` swap).
+        """
+        if self._base_image is None or self._zoom <= 0:
+            return
+        canvas = self._base_image.copy()
+        draw_fn(ImageDraw.Draw(canvas))
+        self._ctk_image = ctk.CTkImage(light_image=canvas, size=(canvas.width, canvas.height))
+        self._label.configure(image=self._ctk_image, text="")
+
+    def _to_px(self, x: float, y: float) -> tuple[float, float]:
+        """Map a PDF-space point back to a pixel position on the preview.
+
+        The exact inverse of `_on_click`'s forward
+        `pixel / zoom + origin` formula.
+        """
+        return ((x - self._origin[0]) * self._zoom, (y - self._origin[1]) * self._zoom)
+
+    def mark_point(self, point: tuple[float, float]) -> None:
+        """Draw a small crosshair marker at `point` (PDF-space)."""
+
+        def _draw(draw: ImageDraw.ImageDraw) -> None:
+            px, py = self._to_px(*point)
+            draw.line(
+                (px - _MARKER_RADIUS, py, px + _MARKER_RADIUS, py),
+                fill=_MARK_COLOR,
+                width=_MARK_WIDTH,
+            )
+            draw.line(
+                (px, py - _MARKER_RADIUS, px, py + _MARKER_RADIUS),
+                fill=_MARK_COLOR,
+                width=_MARK_WIDTH,
+            )
+
+        self._render_overlay(_draw)
+
+    def mark_span(self, bbox: tuple[float, float, float, float]) -> None:
+        """Draw a rectangle outline around `bbox` (PDF-space)."""
+
+        def _draw(draw: ImageDraw.ImageDraw) -> None:
+            x0, y0 = self._to_px(bbox[0], bbox[1])
+            x1, y1 = self._to_px(bbox[2], bbox[3])
+            draw.rectangle((x0, y0, x1, y1), outline=_MARK_COLOR, width=_MARK_WIDTH)
+
+        self._render_overlay(_draw)
+
+    def clear_marks(self) -> None:
+        """Re-render the pristine base image with no drawing on top.
+
+        Goes through the same guarded `_render_overlay` path as
+        `mark_point`/`mark_span` so it is ALSO a correct no-op when there
+        is no base image — never special-cased to skip the guard.
+        """
+        self._render_overlay(lambda draw: None)

@@ -27,7 +27,7 @@ from pathlib import Path
 
 from app.core.services.export_service import ExportService
 from app.core.services.ocr_service import OCRService
-from app.core.services.pdf_service import PDFService
+from app.core.services.pdf_service import PDFService, SpanInfo
 from app.core.services.scan_service import ScanService
 
 
@@ -79,6 +79,8 @@ class PanelValues:
     search_query: str | None = None
     position: str | None = None
     point: tuple[float, float] | None = None
+    selected_span: SpanInfo | None = None
+    replacement: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,7 +123,7 @@ def suggest_output_name(source: Path, suffix: str, ext: str) -> str:
 #: Mode -> off-thread dispatch lambda for `edit_pdf` (Family F). Keyed by
 #: the same mode strings `EditPanel.collect()` sets on `PanelValues.mode` —
 #: `EditPanel`'s local guard (ADR-004) guarantees `v.mode` is always one of
-#: these 3 keys by the time `_run_edit_pdf` reads it, so no `KeyError`
+#: these 4 keys by the time `_run_edit_pdf` reads it, so no `KeyError`
 #: fallback is needed (design §"Registry entry + dispatch").
 _EDIT_DISPATCH: dict[str, Callable[[PDFService, PanelValues], Path]] = {
     "add_text": lambda s, v: s.add_text(
@@ -129,6 +131,9 @@ _EDIT_DISPATCH: dict[str, Callable[[PDFService, PanelValues], Path]] = {
     ),
     "highlight_text": lambda s, v: s.highlight_text(v.source, v.output, v.search_query, v.page),
     "redact_text": lambda s, v: s.redact_text(v.source, v.output, v.search_query, v.page),
+    "replace_text": lambda s, v: s.replace_text(
+        v.source, v.output, v.page, v.selected_span, v.replacement
+    ),
 }
 
 
