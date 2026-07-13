@@ -436,6 +436,7 @@ class EditPanel(InputPanel):
         """
         self._clear_click_point()
         self._clear_selection()
+        self._clear_advanced_editor_feedback()
         self._forget_group(self._add_group)
         self._forget_group(self._search_group)
         self._forget_group(self._replace_group)
@@ -493,6 +494,22 @@ class EditPanel(InputPanel):
         self._selection_feedback.configure(text="")
         self._preview.clear_marks()
 
+    def _clear_advanced_editor_feedback(self) -> None:
+        """Reset any stale `_advanced_editor_feedback` text.
+
+        Mirrors `_clear_click_point()`/`_clear_selection()` exactly, for
+        the same reason: a message set by `_launch_advanced_editor` (a
+        missing-PySide6 or launch-failed message) pertains only to the
+        launch attempt that produced it — every event that can make that
+        message stale (a new source file, or leaving `replace_text` mode
+        and coming back) MUST clear it too, or a failed-launch message
+        can silently persist across an unrelated mode/source change and
+        be mistaken for still-current state. `_launch_advanced_editor`
+        itself already clears/sets this label on every one of its own
+        exit paths; this method covers the OTHER invalidating events.
+        """
+        self._advanced_editor_feedback.configure(text="")
+
     def _on_source_change(self, path: Path | None) -> None:
         """`SourceRow.on_change` fan-out target.
 
@@ -501,10 +518,12 @@ class EditPanel(InputPanel):
         refresh (`sdd/edit-pdf-preview/design` D3), without changing
         `SourceRow`'s shared single-callback signature. Clears any
         stored click point/selection first — see `_clear_click_point`/
-        `_clear_selection`.
+        `_clear_selection`. Also clears any stale Advanced Editor launch
+        message — see `_clear_advanced_editor_feedback`.
         """
         self._clear_click_point()
         self._clear_selection()
+        self._clear_advanced_editor_feedback()
         self._save_as_row.set_source(path)
         self._sync_advanced_editor_button()
         self._refresh_preview()
@@ -681,7 +700,7 @@ class EditPanel(InputPanel):
         except OSError:
             self._advanced_editor_feedback.configure(text=_ADVANCED_EDITOR_LAUNCH_FAILED_MESSAGE)
             return
-        self._advanced_editor_feedback.configure(text="")
+        self._clear_advanced_editor_feedback()
 
     def collect(self) -> PanelValues:
         source = self._source_row.path

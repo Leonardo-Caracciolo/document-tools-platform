@@ -1116,3 +1116,49 @@ class TestEditPanelAdvancedEditor:
         panel._launch_advanced_editor()
 
         assert panel._selection_feedback.cget("text") == "Selected: 'kept as-is'"
+
+    # -- `_advanced_editor_feedback` invalidation on source/mode change —
+    # review-caught regression: a failed-launch message (missing PySide6
+    # or launch-failed) must not survive a mode/source change that has
+    # nothing to do with the launch attempt that produced it. Direct
+    # template: `TestEditPanelAdvancedEditor`'s own `_launch_advanced_editor`
+    # tests above, and the `_click_point`/`_selected_span` invalidation
+    # tests elsewhere in this module.
+
+    def test_on_source_change_clears_a_stale_launch_failure_message(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=None)
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+        panel._launch_advanced_editor()
+        assert (
+            panel._advanced_editor_feedback.cget("text") == panels_module._PYSIDE6_MISSING_MESSAGE
+        )
+
+        panel._source_row._path = Path("different.pdf")
+        panel._on_source_change(Path("different.pdf"))
+
+        assert panel._advanced_editor_feedback.cget("text") == ""
+
+    def test_mode_change_away_and_back_clears_a_stale_launch_failure_message(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=None)
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+        panel._launch_advanced_editor()
+        assert (
+            panel._advanced_editor_feedback.cget("text") == panels_module._PYSIDE6_MISSING_MESSAGE
+        )
+
+        panel._on_mode_change("Add text")
+        panel._on_mode_change("Replace text")
+
+        assert panel._advanced_editor_feedback.cget("text") == ""
