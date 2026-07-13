@@ -23,6 +23,7 @@ from tests.fixtures.pdf_factory import (
     make_image_heavy_pdf,
     make_jpg,
     make_native_text_pdf,
+    make_styled_text_pdf,
     make_table_pdf,
     make_text_pdf_with_matches,
     make_valid_pdf,
@@ -156,6 +157,31 @@ def text_pdf_with_matches_factory(tmp_path: Path) -> Callable[..., Path]:
         default_pages_text = ["invoice invoice", "nothing here", "total due"]
         return make_text_pdf_with_matches(
             tmp_path / name, pages_text if pages_text is not None else default_pages_text
+        )
+
+    return _make
+
+
+@pytest.fixture
+def styled_text_pdf_factory(tmp_path: Path) -> Callable[..., Path]:
+    """Return a callable that writes a PDF with text at a known point/font/
+    size/color under `tmp_path`."""
+
+    def _make(
+        name: str = "styled.pdf",
+        text: str = "Hello World",
+        point: tuple[float, float] = (72, 100),
+        fontname: str = "Helvetica",
+        fontsize: float = 14,
+        color: tuple[float, float, float] = (1, 0, 0),
+    ) -> Path:
+        return make_styled_text_pdf(
+            tmp_path / name,
+            text=text,
+            point=point,
+            fontname=fontname,
+            fontsize=fontsize,
+            color=color,
         )
 
     return _make

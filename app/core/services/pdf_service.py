@@ -55,6 +55,8 @@ Operation = Literal[
     "highlight_text",
     "redact_text",
     "render_page",
+    "find_span_at_point",
+    "replace_text",
 ]
 
 #: The five preset anchor positions `add_text` can place text at —
@@ -92,6 +94,27 @@ class PagePreviewResult:
     image: Image.Image
     zoom: float
     origin: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class SpanInfo:
+    """A single text span found by `PDFService.find_span_at_point`.
+
+    Mirrors `pymupdf`'s `get_text("dict")` span shape, with `color`
+    already converted from the raw packed sRGB int to a ready-to-use
+    `(r, g, b)` 0-1 tuple (see `PDFService._srgb_int_to_rgb`) — no
+    packed int ever leaks past the service boundary. `origin` is the
+    span's baseline point, the same coordinate convention
+    `insert_text`'s `point` argument expects (see `_anchor_point`'s
+    docstring), so `replace_text` can pass it straight through.
+    """
+
+    text: str
+    bbox: tuple[float, float, float, float]
+    origin: tuple[float, float]
+    font: str
+    size: float
+    color: tuple[float, float, float]
 
 
 class PDFService:
@@ -581,7 +604,7 @@ class PDFService:
         return output
 
     def _anchor_point(
-        self, position: TextAnchor, rect: pymupdf.Rect, text: str
+        self, position: TextAnchor, rect: pymupdf.Rect, text: str, fontname: str, fontsize: float
     ) -> tuple[float, float]:
         """Map `position` to an `(x, y)` baseline point within `rect`.
 
@@ -591,19 +614,20 @@ class PDFService:
         at `point=(72, 50)` renders with its glyph box bottom near
         `y=53`, not its top; re-verify if the pin is ever bumped), so
         `top`/`bottom` are computed with that in mind:
-        `top` sits one `_ADD_TEXT_FONTSIZE` below the margin (so the
-        glyph's ascender clears the margin line), `bottom` sits directly
-        on the margin (the baseline itself, descenders may dip slightly
-        below). Right/center alignment need `text`'s measured width
+        `top` sits one `fontsize` below the margin (so the glyph's
+        ascender clears the margin line), `bottom` sits directly on the
+        margin (the baseline itself, descenders may dip slightly below).
+        Right/center alignment need `text`'s measured width
         (`pymupdf.get_text_length`) since the point is the text's left
-        edge, not its bounding box.
+        edge, not its bounding box. `fontname`/`fontsize` are the
+        RESOLVED style (dominant-font detection or the fixed default —
+        see `add_text`), not always the fixed module constants, so this
+        measurement matches whatever font is actually inserted.
         """
-        width = pymupdf.get_text_length(
-            text, fontname=_ADD_TEXT_FONTNAME, fontsize=_ADD_TEXT_FONTSIZE
-        )
+        width = pymupdf.get_text_length(text, fontname=fontname, fontsize=fontsize)
         left = rect.x0 + _EDIT_MARGIN
         right = rect.x1 - _EDIT_MARGIN - width
-        top = rect.y0 + _EDIT_MARGIN + _ADD_TEXT_FONTSIZE
+        top = rect.y0 + _EDIT_MARGIN + fontsize
         bottom = rect.y1 - _EDIT_MARGIN
         center_x = (rect.x0 + rect.x1) / 2 - width / 2
         center_y = (rect.y0 + rect.y1) / 2
@@ -656,6 +680,153 @@ class PDFService:
             total += len(rects)
         return total
 
+    def _srgb_int_to_rgb(self, packed: int) -> tuple[float, float, float]:
+        """Unpack a `pymupdf` span's packed sRGB int into a 0-1 `(r, g, b)` tuple.
+
+        `get_text("dict")` reports each span's `color` as a single int
+        with the 3 channels bit-packed 0xRRGGBB (confirmed empirically
+        against this project's installed pymupdf 1.28.0) — `insert_text`'s
+        `color` kwarg wants the inverse: a 0-1 float tuple. This is the
+        one conversion site; `SpanInfo.color` is always already converted
+        by the time it leaves `find_span_at_point`.
+        """
+        return (((packed >> 16) & 0xFF) / 255, ((packed >> 8) & 0xFF) / 255, (packed & 0xFF) / 255)
+
+    def _resolve_usable_font(self, font: str, size: float) -> tuple[str, float]:
+        """Return `(font, size)` unchanged if `font` is directly usable by `insert_text`.
+
+        `insert_text` RAISES for a font name not in `pymupdf.Base14_fontnames`
+        (it needs an actual font file/buffer for anything else — e.g. a
+        subsetted embedded font like `"ABCDEF+ArialMT"`) — so a detected
+        non-base-14 font must fall back to the fixed default `(font,
+        size)` pair BEFORE `insert_text` is ever called, not caught after.
+        """
+        if font in pymupdf.Base14_fontnames:
+            return font, size
+        return _ADD_TEXT_FONTNAME, _ADD_TEXT_FONTSIZE
+
+    def _dominant_style(self, page: pymupdf.Page) -> tuple[str, float] | None:
+        """Return `page`'s most common `(font, size)` span style, weighted by character count.
+
+        Weighting by `len(span["text"])` (character count, not span
+        count) means a page with one short bold title and much longer
+        body text correctly picks the body text's style — a naive
+        per-span count would let a handful of short title spans
+        outvote a smaller number of much-longer body spans. `size` is
+        rounded to 1 decimal place before bucketing to avoid float
+        fragmentation splitting what is really one style into several
+        near-identical tally keys. Returns `None` when `page` has no
+        text spans at all (a blank page, or an image-only page).
+        """
+        tally: dict[tuple[str, float], int] = {}
+        for block in page.get_text("dict")["blocks"]:
+            for line in block.get("lines", ()):  # image blocks have no "lines"
+                for span in line["spans"]:
+                    key = (span["font"], round(span["size"], 1))
+                    tally[key] = tally.get(key, 0) + len(span["text"])
+        if not tally:
+            return None
+        return max(tally, key=lambda k: tally[k])
+
+    def find_span_at_point(
+        self, source: Path, page: int, point: tuple[float, float]
+    ) -> SpanInfo | None:
+        """Return the first text span on `page` whose bbox contains `point`, or `None`.
+
+        Read-only: no `output`, no write, no `_make_output_dir`. `page`
+        is 1-based, same convention as every other page-taking operation.
+        Spans are walked in document order (`get_text("dict")["blocks"]`
+        -> `"lines"` -> `"spans"`) and the FIRST containing span wins —
+        a point in empty space returning `None` is a NORMAL result, not
+        an exception, so a caller (e.g. a click handler) never needs to
+        catch anything just to detect a miss.
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes or `page`
+                is out of range.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source, "find_span_at_point")
+
+        with self._translate_pymupdf_errors("find_span_at_point", source):
+            doc = pymupdf.open(source)
+            try:
+                self._validate_pages([page], doc.page_count, source, "find_span_at_point")
+                pg = doc.load_page(page - 1)
+                target = pymupdf.Point(*point)
+                for block in pg.get_text("dict")["blocks"]:
+                    for line in block.get("lines", ()):
+                        for span in line["spans"]:
+                            if pymupdf.Rect(*span["bbox"]).contains(target):
+                                return SpanInfo(
+                                    text=span["text"],
+                                    bbox=tuple(span["bbox"]),
+                                    origin=tuple(span["origin"]),
+                                    font=span["font"],
+                                    size=span["size"],
+                                    color=self._srgb_int_to_rgb(span["color"]),
+                                )
+                return None
+            finally:
+                doc.close()
+
+    def replace_text(
+        self, source: Path, output: Path, page: int, span: SpanInfo, replacement: str
+    ) -> Path:
+        """Redact `span`'s bbox on `page`, insert `replacement` at its origin, write to `output`.
+
+        `page` is 1-based. The empty-replacement guard runs before
+        `source` is even opened (mirrors `add_text`'s empty-text guard
+        placement); the page-range check runs after opening, once
+        `doc.page_count` is known, before any mutation — same
+        validate-then-write convention as every other operation.
+
+        `span` is trusted as given: this method does NOT re-hit-test
+        `span`'s bbox against `source`'s current content — if the
+        document changed between when `span` was captured and this call,
+        the redact-then-insert still executes at `span`'s stored
+        coordinates without re-validation. Uses `span`'s detected
+        `(font, size)` when usable (`_resolve_usable_font`), else the
+        fixed default; `span.color` is always used regardless of the
+        font fallback. `apply_redactions()`'s default fill is white
+        (confirmed empirically, no `fill=` kwarg needed), and
+        `insert_text` runs on the SAME `Page` object immediately after,
+        no reload required (confirmed empirically).
+
+        Raises:
+            `EntradaInvalidaError`: `source` is missing/0 bytes,
+                `replacement` is empty/blank, `page` is out of range, or
+                `output`'s parent directory cannot be created.
+            `PDFCorruptoError`: `source` fails to parse.
+        """
+        self._require_nonempty_file(source, "replace_text")
+        if not replacement or not replacement.strip():
+            self._log.warning("replace_text failed: empty replacement (%s)", source.name)
+            raise EntradaInvalidaError("Replacement text must not be empty.")
+
+        self._log.info("replace_text start: %s", source.name)
+
+        with self._translate_pymupdf_errors("replace_text", source):
+            doc = pymupdf.open(source)
+            try:
+                self._validate_pages([page], doc.page_count, source, "replace_text")
+                pg = doc.load_page(page - 1)
+                pg.add_redact_annot(pymupdf.Rect(*span.bbox))
+                pg.apply_redactions()
+                fontname, fontsize = self._resolve_usable_font(span.font, span.size)
+                pg.insert_text(
+                    span.origin, replacement, fontname=fontname, fontsize=fontsize, color=span.color
+                )
+
+                # Mutation succeeded: safe to create the output dir and write.
+                self._make_output_dir(output.parent, "replace_text")
+                doc.save(output)
+            finally:
+                doc.close()
+
+        self._log.info("replace_text ok: %s -> %s", source.name, output.name)
+        return output
+
     def add_text(
         self,
         source: Path,
@@ -679,6 +850,15 @@ class PDFService:
         point is derived from `position` via `_anchor_point`, unchanged
         from prior behavior.
 
+        The insertion style defaults to `page`'s dominant `(font, size)`
+        (`_dominant_style`, char-weighted) when that font is usable
+        (`_resolve_usable_font`); a page with no detectable text, or
+        whose dominant font is not base-14, falls back to the fixed
+        default (`helv`, size 11) — unchanged from prior behavior. This
+        detection is entirely internal: it does not change this method's
+        public signature, and is orthogonal to the point-vs-position
+        placement precedence above.
+
         Raises:
             `EntradaInvalidaError`: `source` is missing/0 bytes, `text`
                 is empty/blank, `page` is out of range, or `output`'s
@@ -697,12 +877,18 @@ class PDFService:
             try:
                 self._validate_pages([page], doc.page_count, source, "add_text")
                 pg = doc.load_page(page - 1)
+                style = self._dominant_style(pg)
+                fontname, fontsize = (
+                    self._resolve_usable_font(*style)
+                    if style is not None
+                    else (_ADD_TEXT_FONTNAME, _ADD_TEXT_FONTSIZE)
+                )
                 insertion = (
-                    point if point is not None else self._anchor_point(position, pg.rect, text)
+                    point
+                    if point is not None
+                    else self._anchor_point(position, pg.rect, text, fontname, fontsize)
                 )
-                pg.insert_text(
-                    insertion, text, fontname=_ADD_TEXT_FONTNAME, fontsize=_ADD_TEXT_FONTSIZE
-                )
+                pg.insert_text(insertion, text, fontname=fontname, fontsize=fontsize)
 
                 # Mutation succeeded: safe to create the output dir and write.
                 self._make_output_dir(output.parent, "add_text")

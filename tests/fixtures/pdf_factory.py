@@ -158,6 +158,30 @@ def make_text_pdf_with_matches(path: Path, pages_text: list[str]) -> Path:
     return path
 
 
+def make_styled_text_pdf(
+    path: Path,
+    text: str = "Hello World",
+    point: tuple[float, float] = (72, 100),
+    fontname: str = "Helvetica",
+    fontsize: float = 14,
+    color: tuple[float, float, float] = (1, 0, 0),
+) -> Path:
+    """Write a single-page PDF with `text` inserted at a KNOWN `point`/font/
+    size/color to `path`, for `find_span_at_point`/`replace_text` tests
+    that must assert against a known span shape (bbox/origin/font/size/
+    color), not just "some text exists somewhere" (as
+    `make_native_text_pdf` is used for elsewhere).
+    """
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page()
+        page.insert_text(point, text, fontname=fontname, fontsize=fontsize, color=color)
+        doc.save(path)
+    finally:
+        doc.close()
+    return path
+
+
 def make_corrupt_jpg(path: Path) -> Path:
     """Write a non-image file (plain bytes, `.jpg` extension) to `path`.
 

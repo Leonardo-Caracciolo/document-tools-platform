@@ -27,7 +27,13 @@ from app.core.exceptions import (
     PDFCorruptoError,
     PDFSinCoincidenciasError,
 )
-from app.core.services.pdf_service import PagePreviewResult, PDFService
+from app.core.services.pdf_service import (
+    _ADD_TEXT_FONTNAME,
+    _ADD_TEXT_FONTSIZE,
+    PagePreviewResult,
+    PDFService,
+    SpanInfo,
+)
 from tests.fixtures.pdf_factory import make_corrupt_pdf, make_empty_file, make_valid_pdf
 
 
@@ -825,6 +831,8 @@ class TestAnchorPoint:
 
     _RECT = pymupdf.Rect(0, 0, 612, 792)  # Letter page, points, origin top-left
     _TEXT = "Hi"
+    _FONTNAME = "helv"
+    _FONTSIZE = 11
     # pymupdf.get_text_length("Hi", fontname="helv", fontsize=11) == this
     # exact value (verified empirically, hardcoded so this test does not
     # re-derive the same measurement `_anchor_point` itself performs).
@@ -833,35 +841,45 @@ class TestAnchorPoint:
     def test_top_left(self) -> None:
         service = PDFService()
 
-        point = service._anchor_point("top-left", self._RECT, self._TEXT)
+        point = service._anchor_point(
+            "top-left", self._RECT, self._TEXT, self._FONTNAME, self._FONTSIZE
+        )
 
         assert point == pytest.approx((36, 47))
 
     def test_top_right(self) -> None:
         service = PDFService()
 
-        point = service._anchor_point("top-right", self._RECT, self._TEXT)
+        point = service._anchor_point(
+            "top-right", self._RECT, self._TEXT, self._FONTNAME, self._FONTSIZE
+        )
 
         assert point == pytest.approx((612 - 36 - self._WIDTH, 47))
 
     def test_bottom_left(self) -> None:
         service = PDFService()
 
-        point = service._anchor_point("bottom-left", self._RECT, self._TEXT)
+        point = service._anchor_point(
+            "bottom-left", self._RECT, self._TEXT, self._FONTNAME, self._FONTSIZE
+        )
 
         assert point == pytest.approx((36, 756))
 
     def test_bottom_right(self) -> None:
         service = PDFService()
 
-        point = service._anchor_point("bottom-right", self._RECT, self._TEXT)
+        point = service._anchor_point(
+            "bottom-right", self._RECT, self._TEXT, self._FONTNAME, self._FONTSIZE
+        )
 
         assert point == pytest.approx((612 - 36 - self._WIDTH, 756))
 
     def test_center(self) -> None:
         service = PDFService()
 
-        point = service._anchor_point("center", self._RECT, self._TEXT)
+        point = service._anchor_point(
+            "center", self._RECT, self._TEXT, self._FONTNAME, self._FONTSIZE
+        )
 
         assert point == pytest.approx((306 - self._WIDTH / 2, 396))
 
@@ -874,10 +892,93 @@ class TestAnchorPoint:
         to its intended anchor."""
         service = PDFService()
 
-        top_point = service._anchor_point("top-left", self._RECT, self._TEXT)
-        bottom_point = service._anchor_point("bottom-left", self._RECT, self._TEXT)
+        top_point = service._anchor_point(
+            "top-left", self._RECT, self._TEXT, self._FONTNAME, self._FONTSIZE
+        )
+        bottom_point = service._anchor_point(
+            "bottom-left", self._RECT, self._TEXT, self._FONTNAME, self._FONTSIZE
+        )
 
         assert bottom_point[1] > top_point[1]
+
+
+class TestSrgbIntToRgb:
+    """Tests for `PDFService._srgb_int_to_rgb`."""
+
+    @pytest.mark.parametrize(
+        ("packed", "expected"),
+        [
+            (0xFF0000, (1.0, 0.0, 0.0)),
+            (0x00FF00, (0.0, 1.0, 0.0)),
+            (0x0000FF, (0.0, 0.0, 1.0)),
+            (0x000000, (0.0, 0.0, 0.0)),
+            (0xFFFFFF, (1.0, 1.0, 1.0)),
+        ],
+    )
+    def test_srgb_int_to_rgb_round_trip(
+        self, packed: int, expected: tuple[float, float, float]
+    ) -> None:
+        service = PDFService()
+
+        assert service._srgb_int_to_rgb(packed) == pytest.approx(expected)
+
+
+class TestResolveUsableFont:
+    """Tests for `PDFService._resolve_usable_font`."""
+
+    def test_resolve_usable_font_keeps_base14_font_unchanged(self) -> None:
+        service = PDFService()
+
+        assert service._resolve_usable_font("Times-Roman", 18.0) == ("Times-Roman", 18.0)
+
+    def test_resolve_usable_font_falls_back_for_non_base14_font(self) -> None:
+        service = PDFService()
+
+        assert service._resolve_usable_font("ABCDEF+ArialMT", 18.0) == (
+            _ADD_TEXT_FONTNAME,
+            _ADD_TEXT_FONTSIZE,
+        )
+
+
+class TestDominantStyle:
+    """Tests for `PDFService._dominant_style`."""
+
+    def test_dominant_style_picks_char_weighted_body_text_over_title(self) -> None:
+        doc = pymupdf.open()
+        try:
+            page = doc.new_page()
+            page.insert_text((72, 72), "Title", fontname="Helvetica-Bold", fontsize=16)
+            page.insert_text(
+                (72, 120),
+                "This is a much longer line of body text repeated for weight",
+                fontname="Helvetica",
+                fontsize=11,
+            )
+            page.insert_text(
+                (72, 140),
+                "More body text to further weight the tally towards body",
+                fontname="Helvetica",
+                fontsize=11,
+            )
+            service = PDFService()
+
+            result = service._dominant_style(page)
+
+            assert result == ("Helvetica", 11.0)
+        finally:
+            doc.close()
+
+    def test_dominant_style_returns_none_for_blank_page(self) -> None:
+        doc = pymupdf.open()
+        try:
+            page = doc.new_page()
+            service = PDFService()
+
+            result = service._dominant_style(page)
+
+            assert result is None
+        finally:
+            doc.close()
 
 
 class TestAddText:
@@ -993,6 +1094,65 @@ class TestAddText:
         try:
             rects = doc.load_page(0).search_for("Preset marker")
             assert rects
+        finally:
+            doc.close()
+
+    @staticmethod
+    def _find_span(doc: pymupdf.Document, text: str) -> dict[str, object] | None:
+        """Return the first span matching `text` (stripped) on page 0, or `None`."""
+        page = doc.load_page(0)
+        for block in page.get_text("dict")["blocks"]:
+            for line in block.get("lines", ()):
+                for span in line["spans"]:
+                    if span["text"].strip() == text:
+                        return span
+        return None
+
+    def test_add_text_uses_detected_dominant_font_when_present(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Regression for the `add_text Method Contract` MODIFIED
+        requirement: when the target page already has text, `add_text`
+        must default to ITS dominant style, not the fixed `helv`/11."""
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        seeded = tmp_path / "seeded.pdf"
+        doc = pymupdf.open(source)
+        try:
+            doc.load_page(0).insert_text(
+                (72, 300), "Existing body text", fontname="Times-Roman", fontsize=14
+            )
+            doc.save(seeded)
+        finally:
+            doc.close()
+        output = tmp_path / "edited.pdf"
+
+        service.add_text(seeded, output, page=1, text="Anchor marker", position="top-left")
+
+        doc = pymupdf.open(output)
+        try:
+            found = self._find_span(doc, "Anchor marker")
+            assert found is not None
+            assert found["font"] == "Times-Roman"
+            assert found["size"] == pytest.approx(14.0)
+        finally:
+            doc.close()
+
+    def test_add_text_falls_back_to_fixed_default_on_page_with_no_text(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        output = tmp_path / "edited.pdf"
+
+        service.add_text(source, output, page=1, text="Anchor marker", position="top-left")
+
+        doc = pymupdf.open(output)
+        try:
+            found = self._find_span(doc, "Anchor marker")
+            assert found is not None
+            assert found["font"] == "Helvetica"
+            assert found["size"] == pytest.approx(11.0)
         finally:
             doc.close()
 
@@ -1274,6 +1434,240 @@ class TestRedactText:
             service.redact_text(
                 source, tmp_path / "redacted.pdf", query="confidential", page=9
             )
+
+
+class TestFindSpanAtPoint:
+    """Tests for `PDFService.find_span_at_point`."""
+
+    @staticmethod
+    def _ground_truth_span(source: Path) -> dict[str, object]:
+        """Independently query the first span on page 0 — NOT via
+        `find_span_at_point` — so tests assert against a genuinely
+        independent expectation, not a circular re-derivation."""
+        doc = pymupdf.open(source)
+        try:
+            return doc.load_page(0).get_text("dict")["blocks"][0]["lines"][0]["spans"][0]
+        finally:
+            doc.close()
+
+    def test_find_span_at_point_returns_matching_span_info(
+        self, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = styled_text_pdf_factory(
+            "styled.pdf",
+            text="Hello Span",
+            point=(72, 100),
+            fontname="Helvetica",
+            fontsize=14,
+            color=(1, 0, 0),
+        )
+        expected = self._ground_truth_span(source)
+        click_point = (
+            (expected["bbox"][0] + expected["bbox"][2]) / 2,
+            (expected["bbox"][1] + expected["bbox"][3]) / 2,
+        )
+        service = PDFService()
+
+        result = service.find_span_at_point(source, page=1, point=click_point)
+
+        assert result is not None
+        assert result.text == expected["text"]
+        assert result.bbox == pytest.approx(tuple(expected["bbox"]))
+        assert result.origin == pytest.approx(tuple(expected["origin"]))
+        assert result.font == "Helvetica"
+        assert result.size == pytest.approx(14.0)
+        assert result.color == pytest.approx((1.0, 0.0, 0.0))
+
+    def test_find_span_at_point_returns_none_for_empty_space(
+        self, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        service = PDFService()
+
+        result = service.find_span_at_point(source, page=1, point=(500, 700))
+
+        assert result is None
+
+    def test_find_span_at_point_raises_entrada_invalida_for_out_of_range_page(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError, match="5"):
+            service.find_span_at_point(source, page=5, point=(0, 0))
+
+    def test_find_span_at_point_raises_entrada_invalida_for_empty_source(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+
+        with pytest.raises(EntradaInvalidaError):
+            service.find_span_at_point(source, page=1, point=(0, 0))
+
+    def test_find_span_at_point_raises_pdf_corrupto_for_corrupt_source(
+        self, tmp_path: Path, corrupt_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = corrupt_pdf_factory("corrupt.pdf")
+        service = PDFService()
+
+        with pytest.raises(PDFCorruptoError):
+            service.find_span_at_point(source, page=1, point=(0, 0))
+
+
+class TestReplaceText:
+    """Tests for `PDFService.replace_text`."""
+
+    def test_replace_text_base14_span_replaced_and_survives_reload(
+        self, tmp_path: Path, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Spec scenario 'Base-14 span replaced with matching style' —
+        verifies real permanence via reload (mirrors
+        `test_redact_text_single_page_match_is_gone_from_extracted_text`'s
+        established permanence-testing pattern for this project)."""
+        source = styled_text_pdf_factory(
+            "styled.pdf",
+            text="OldWord",
+            point=(72, 100),
+            fontname="Helvetica",
+            fontsize=14,
+            color=(1, 0, 0),
+        )
+        service = PDFService()
+        expected = TestFindSpanAtPoint._ground_truth_span(source)
+        click_point = (
+            (expected["bbox"][0] + expected["bbox"][2]) / 2,
+            (expected["bbox"][1] + expected["bbox"][3]) / 2,
+        )
+        span = service.find_span_at_point(source, page=1, point=click_point)
+        assert span is not None
+        output = tmp_path / "replaced.pdf"
+
+        result = service.replace_text(source, output, page=1, span=span, replacement="NewWord")
+
+        assert result == output
+        doc = pymupdf.open(output)
+        try:
+            page = doc.load_page(0)
+            assert page.search_for("OldWord") == []
+            assert "oldword" not in page.get_text().lower()
+            found = TestAddText._find_span(doc, "NewWord")
+            assert found is not None
+            assert found["font"] == "Helvetica"
+            assert found["size"] == pytest.approx(14.0)
+            assert service._srgb_int_to_rgb(found["color"]) == pytest.approx((1.0, 0.0, 0.0))
+        finally:
+            doc.close()
+
+    def test_replace_text_non_base14_font_falls_back_to_fixed_default_color_preserved(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Spec scenario 'Non-base-14 font falls back, color preserved' —
+        constructs a `SpanInfo` directly with a made-up font name; no
+        real subsetted-font PDF is needed to exercise the fallback
+        branch (`_resolve_usable_font`)."""
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        span = SpanInfo(
+            text="whatever",
+            bbox=(72.0, 80.0, 200.0, 100.0),
+            origin=(72.0, 95.0),
+            font="NotARealFont",
+            size=20.0,
+            color=(0.2, 0.4, 0.6),
+        )
+        output = tmp_path / "replaced.pdf"
+
+        result = service.replace_text(source, output, page=1, span=span, replacement="Fallback")
+
+        assert result == output
+        doc = pymupdf.open(output)
+        try:
+            found = TestAddText._find_span(doc, "Fallback")
+            assert found is not None
+            assert found["font"] == "Helvetica"  # _ADD_TEXT_FONTNAME "helv" reports as this
+            assert found["size"] == pytest.approx(11.0)
+            assert service._srgb_int_to_rgb(found["color"]) == pytest.approx((0.2, 0.4, 0.6))
+        finally:
+            doc.close()
+
+    def test_replace_text_raises_entrada_invalida_for_empty_replacement(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        span = SpanInfo(
+            text="x",
+            bbox=(0, 0, 10, 10),
+            origin=(0, 10),
+            font="Helvetica",
+            size=11,
+            color=(0, 0, 0),
+        )
+        output = tmp_path / "replaced.pdf"
+
+        with pytest.raises(EntradaInvalidaError):
+            service.replace_text(source, output, page=1, span=span, replacement="   ")
+
+        assert not output.exists()
+
+    def test_replace_text_raises_entrada_invalida_for_out_of_range_page(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        span = SpanInfo(
+            text="x",
+            bbox=(0, 0, 10, 10),
+            origin=(0, 10),
+            font="Helvetica",
+            size=11,
+            color=(0, 0, 0),
+        )
+
+        with pytest.raises(EntradaInvalidaError, match="5"):
+            service.replace_text(
+                source, tmp_path / "replaced.pdf", page=5, span=span, replacement="y"
+            )
+
+    def test_replace_text_stale_span_still_executes_without_crash(
+        self, tmp_path: Path, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Spec scenario 'Stale span still executes without crash' —
+        `replace_text` MUST NOT re-hit-test `span` against `source`'s
+        current content; a span captured before an unrelated edit still
+        executes at its stored bbox/origin with no exception."""
+        source = styled_text_pdf_factory(
+            "styled.pdf", text="Original", point=(72, 100), fontname="Helvetica", fontsize=14
+        )
+        service = PDFService()
+        stale_span = TestFindSpanAtPoint._ground_truth_span(source)
+        span = SpanInfo(
+            text=stale_span["text"],
+            bbox=tuple(stale_span["bbox"]),
+            origin=tuple(stale_span["origin"]),
+            font=stale_span["font"],
+            size=stale_span["size"],
+            color=service._srgb_int_to_rgb(stale_span["color"]),
+        )
+        # Simulate an unrelated edit to the document after the span was
+        # captured (a second, unrelated page).
+        doc = pymupdf.open(source)
+        try:
+            doc.new_page()
+            edited = tmp_path / "edited_source.pdf"
+            doc.save(edited)
+        finally:
+            doc.close()
+        output = tmp_path / "replaced.pdf"
+
+        result = service.replace_text(
+            edited, output, page=1, span=span, replacement="Replacement"
+        )
+
+        assert result == output
+        assert output.exists()
 
 
 class TestCrossCuttingLoggingAndExceptionContainment:
