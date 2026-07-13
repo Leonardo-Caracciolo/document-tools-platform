@@ -1,5 +1,7 @@
 """Tests for `AdvancedEditorWindow` — `sdd/qt-advanced-editor-slice1/design`
-"editor_window.py — render-to-display pipeline" (D2, D9).
+"editor_window.py — render-to-display pipeline" (D2, D9) and
+`sdd/qt-advanced-editor-slice2/design` click-to-select + highlight layer
+(D1-D3, D9; slice 2 PR 1 scope only — no Replace/Save/state-machine yet).
 
 Skips cleanly via `importorskip` when PySide6 is absent from the active
 env (it is an optional dependency group — see `pyproject.toml`).
@@ -18,16 +20,19 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pymupdf
 import pytest
 
 pytest.importorskip("PySide6")
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSize  # noqa: E402 - must follow importorskip/env setup
+from PySide6.QtCore import QPointF, QSize  # noqa: E402 - must follow importorskip/env setup
 from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError  # noqa: E402
+from app.core.services.pdf_service import PDFService  # noqa: E402
+from app.qt_editor.clickable_page_item import ClickablePageItem  # noqa: E402
 from app.qt_editor.editor_window import AdvancedEditorWindow  # noqa: E402
 from app.ui.errors import error_message  # noqa: E402
 
@@ -124,3 +129,140 @@ class TestErrorHandling:
         # is not accidentally correct for only one of the two caught
         # exception types.
         assert error_message(PDFCorruptoError("anything")) in central.text()
+
+
+def _point_to_pixel(window: AdvancedEditorWindow, point: tuple[float, float]) -> QPointF:
+    """Forward-map a known PDF point to the item-local pixel `QPointF` a
+    click there would produce, using the window's current `_zoom`/
+    `_origin` — the exact inverse of `_on_canvas_click`'s own mapping
+    (`sdd/qt-advanced-editor-slice2/design` D2, E4-confirmed round-trip)."""
+    return QPointF(
+        (point[0] - window._origin[0]) * window._zoom,
+        (point[1] - window._origin[1]) * window._zoom,
+    )
+
+
+class TestClickToSelect:
+    def test_initial_render_stores_zoom_and_origin(
+        self, qapp: QApplication, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+
+        window = AdvancedEditorWindow(pdf_path, 1)
+
+        assert window._zoom > 0
+        assert window._origin == (0.0, 0.0)
+        assert isinstance(window._pixmap_item, ClickablePageItem)
+
+    def test_click_hits_known_span_selects_and_highlights(
+        self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = styled_text_pdf_factory(
+            "styled.pdf", text="Hello Span", point=(72, 100)
+        )
+        window = AdvancedEditorWindow(pdf_path, 1)
+        doc = pymupdf.open(pdf_path)
+        try:
+            ground_truth = doc.load_page(0).get_text("dict")["blocks"][0]["lines"][0]["spans"][0]
+        finally:
+            doc.close()
+        bbox = ground_truth["bbox"]
+        click_point = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+        pixel = _point_to_pixel(window, click_point)
+
+        window._on_canvas_click(pixel)
+
+        assert window._selected_span is not None
+        assert window._selected_span.text == ground_truth["text"]
+        assert window._selected_label.text() == f"Selected: {ground_truth['text']!r}"
+        assert window._highlight_item is not None
+        assert window._highlight_item in window._scene.items()
+        assert window._feedback.text() == ""
+
+    def test_click_misses_clears_selection_and_shows_hint(
+        self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        window = AdvancedEditorWindow(pdf_path, 1)
+        pixel = _point_to_pixel(window, (500, 700))  # matches empty-space case in PDFService tests
+
+        window._on_canvas_click(pixel)  # must not raise
+
+        assert window._selected_span is None
+        assert window._selected_label.text() == "Selected: (none)"
+        assert window._highlight_item is None
+        assert window._feedback.text() == "No text at that point — click directly on a word."
+
+    def test_click_raising_entrada_invalida_shows_inline_feedback_no_crash(
+        self,
+        qapp: QApplication,
+        valid_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        exc = EntradaInvalidaError("boom")
+        monkeypatch.setattr(
+            PDFService, "find_span_at_point", MagicMock(side_effect=exc)
+        )
+
+        window._on_canvas_click(QPointF(10.0, 10.0))  # must not raise
+
+        assert window._feedback.text() == error_message(exc)
+        assert window._selected_span is None
+
+    def test_click_raising_pdf_corrupto_shows_inline_feedback_no_crash(
+        self,
+        qapp: QApplication,
+        valid_pdf_factory: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pdf_path = valid_pdf_factory(name="sample.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        exc = PDFCorruptoError("boom")
+        monkeypatch.setattr(
+            PDFService, "find_span_at_point", MagicMock(side_effect=exc)
+        )
+
+        window._on_canvas_click(QPointF(10.0, 10.0))  # must not raise
+
+        assert window._feedback.text() == error_message(exc)
+        assert window._selected_span is None
+
+    def test_click_before_any_render_is_a_no_op(
+        self, qapp: QApplication, corrupt_pdf_factory: Callable[..., Path]
+    ) -> None:
+        # Construction render failed (corrupt input), so `_zoom` stays at
+        # its 0.0 default — the `_zoom <= 0` guard must prevent a
+        # division-by-zero click mapping.
+        pdf_path = corrupt_pdf_factory(name="corrupt.pdf")
+        window = AdvancedEditorWindow(pdf_path, 1)
+        assert window._zoom <= 0
+
+        window._on_canvas_click(QPointF(10.0, 10.0))  # must not raise
+
+
+class TestClearSelection:
+    def test_clear_selection_resets_label_and_removes_highlight(
+        self, qapp: QApplication, styled_text_pdf_factory: Callable[..., Path]
+    ) -> None:
+        pdf_path = styled_text_pdf_factory("styled.pdf", text="Hello Span", point=(72, 100))
+        window = AdvancedEditorWindow(pdf_path, 1)
+        doc = pymupdf.open(pdf_path)
+        try:
+            ground_truth = doc.load_page(0).get_text("dict")["blocks"][0]["lines"][0]["spans"][0]
+        finally:
+            doc.close()
+        bbox = ground_truth["bbox"]
+        click_point = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+        window._on_canvas_click(_point_to_pixel(window, click_point))
+        assert window._selected_span is not None
+        highlight_item = window._highlight_item
+        assert highlight_item is not None
+
+        window._clear_selection()
+
+        assert window._selected_span is None
+        assert window._selected_label.text() == "Selected: (none)"
+        assert window._highlight_item is None
+        assert highlight_item not in window._scene.items()
