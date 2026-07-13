@@ -17,6 +17,9 @@ Reusable rows live in `app.ui.widgets.rows` and own their own
 
 from __future__ import annotations
 
+import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 
 import customtkinter as ctk
@@ -282,6 +285,15 @@ _EMPTY_REPLACEMENT_TEXT_MESSAGE = "Enter the replacement text before running."
 _NO_SPAN_SELECTED_MESSAGE = "Click a word in the preview to select the text to replace."
 _NO_SPAN_AT_CLICK_MESSAGE = "No text found here — click a word to select."
 
+#: `sdd/qt-advanced-editor-slice1/design` D5 — `find_spec` pre-launch gate
+#: message (missing optional PySide6 dependency).
+_PYSIDE6_MISSING_MESSAGE = (
+    "Advanced Editor needs the optional PySide6 package. Install it with: pip install PySide6"
+)
+#: `sdd/qt-advanced-editor-slice1/design` D5 — defense-in-depth message for
+#: a `Popen` `OSError` (beyond the primary `find_spec` gate above).
+_ADVANCED_EDITOR_LAUNCH_FAILED_MESSAGE = "Advanced Editor could not be launched. Please try again."
+
 #: Display label the position dropdown shows once a preview click has
 #: stored a point — never one of `_POSITION_PRESETS`, but `CTkOptionMenu`
 #: accepts and displays it via `.set()` regardless (confirmed empirically,
@@ -382,6 +394,21 @@ class EditPanel(InputPanel):
         #: surface (design D5).
         self._selection_feedback = ctk.CTkLabel(self, text="")
 
+        #: `sdd/qt-advanced-editor-slice1/design` D6/D7 — launches a
+        #: separate PySide6 process for read-only advanced page display.
+        #: Visible only in `replace_text` mode (row 4, free in that mode's
+        #: layout); disabled until a source file is selected;
+        #: `_advanced_editor_feedback` is its OWN dedicated inline label —
+        #: never `_selection_feedback`, which owns the span-click-outcome
+        #: lifecycle and must not be stomped by launch messages.
+        self._advanced_editor_button = ctk.CTkButton(
+            self,
+            text="Advanced Editor",
+            command=self._launch_advanced_editor,
+            state="disabled",
+        )
+        self._advanced_editor_feedback = ctk.CTkLabel(self, text="")
+
         self._source_row.grid(row=0, column=0, columnspan=2, sticky="ew")
         self._mode_menu.grid(row=1, column=0, columnspan=2, sticky="w")
         self._grid_group(self._add_group)  # default mode = add_text
@@ -413,6 +440,8 @@ class EditPanel(InputPanel):
         self._forget_group(self._search_group)
         self._forget_group(self._replace_group)
         self._selection_feedback.grid_forget()
+        self._advanced_editor_button.grid_forget()
+        self._advanced_editor_feedback.grid_forget()
         self._preview.grid_forget()
         self._mode = _MODE_BY_LABEL[value]
         if self._mode == "add_text":
@@ -422,6 +451,9 @@ class EditPanel(InputPanel):
             self._grid_group(self._replace_group)
             self._preview.grid(row=5, column=0, columnspan=2, sticky="ew")
             self._selection_feedback.grid(row=6, column=0, columnspan=2, sticky="w")
+            self._advanced_editor_button.grid(row=4, column=0, sticky="w")
+            self._advanced_editor_feedback.grid(row=4, column=1, sticky="w")
+            self._sync_advanced_editor_button()
         else:
             self._grid_group(self._search_group)
 
@@ -474,6 +506,7 @@ class EditPanel(InputPanel):
         self._clear_click_point()
         self._clear_selection()
         self._save_as_row.set_source(path)
+        self._sync_advanced_editor_button()
         self._refresh_preview()
 
     def _on_preview_point(self, point: tuple[float, float]) -> None:
@@ -594,6 +627,61 @@ class EditPanel(InputPanel):
         self._clear_click_point()
         self._clear_selection()
         self._refresh_preview()
+
+    def _sync_advanced_editor_button(self) -> None:
+        """Enable `_advanced_editor_button` only once a source is selected.
+
+        Called from `_on_source_change` and from `_on_mode_change`'s
+        `replace_text` branch, so the button's state is always correct
+        both when a source changes while already in replace mode and when
+        the user switches into replace mode with a source already set
+        (`sdd/qt-advanced-editor-slice1/design` D7).
+        """
+        has_source = self._source_row.path is not None
+        self._advanced_editor_button.configure(state="normal" if has_source else "disabled")
+
+    def _resolve_launch_page(self) -> int:
+        """Resolve the page to hand to the Advanced Editor child process.
+
+        Falls back to page 1 on an unparsable `_replace_page_entry` rather
+        than blocking the launch — this is a fire-and-forget action, and
+        the child process validates the page itself and shows its own
+        in-window error state (`sdd/qt-advanced-editor-slice1/design` D8).
+        """
+        try:
+            return self._parse_page(self._replace_page_entry.get())
+        except EntradaInvalidaError:
+            return 1
+
+    def _launch_advanced_editor(self) -> None:
+        """`command=` target for `_advanced_editor_button`.
+
+        Fire-and-forget: launches `python -m app.qt_editor <source> --page
+        N` as a detached process and returns immediately, never waiting
+        on or tracking the child. `find_spec` is the PRIMARY gate (the
+        child relaunches with the same `sys.executable`, so it reliably
+        predicts child availability); the `try/except OSError` around
+        `Popen` is defense-in-depth beyond that
+        (`sdd/qt-advanced-editor-slice1/design` D5). Feedback is shown
+        exclusively via `_advanced_editor_feedback` — never
+        `_selection_feedback`, which owns the span-click-outcome surface.
+        """
+        source = self._source_row.path
+        if source is None:
+            return  # defensive; the button is disabled in this state
+        if importlib.util.find_spec("PySide6") is None:
+            self._advanced_editor_feedback.configure(text=_PYSIDE6_MISSING_MESSAGE)
+            return
+        page = self._resolve_launch_page()
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "app.qt_editor", str(source), "--page", str(page)],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except OSError:
+            self._advanced_editor_feedback.configure(text=_ADVANCED_EDITOR_LAUNCH_FAILED_MESSAGE)
+            return
+        self._advanced_editor_feedback.configure(text="")
 
     def collect(self) -> PanelValues:
         source = self._source_row.path

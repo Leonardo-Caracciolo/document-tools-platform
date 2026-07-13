@@ -25,6 +25,7 @@ dependencies = [
 [dependency-groups]
 lint = ["ruff"]
 test = ["pytest", "python-docx"]
+qt = ["PySide6>=6.11,<7"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

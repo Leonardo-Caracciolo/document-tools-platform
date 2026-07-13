@@ -28,6 +28,8 @@ silently, this is why — do not chase it as a production bug.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -857,3 +859,260 @@ class TestEditPanelReplaceMode:
         assert panel._selection_feedback.cget("text") == ""
         with pytest.raises(EntradaInvalidaError):
             panel.collect()
+
+
+class TestEditPanelAdvancedEditor:
+    """`sdd/qt-advanced-editor-slice1/spec` — "Advanced Editor Button
+    Visibility", "Button Enablement Gated by Source Selection", "PySide6
+    Pre-Launch Availability Check", "Fire-and-Forget Subprocess Launch",
+    "Active Page Resolution", "Launch OSError Defense".
+
+    `find_spec` and `Popen` are ALWAYS mocked in every launch test here —
+    a real Qt process must never be spawned by this suite
+    (`sdd/qt-advanced-editor-slice1/design` Testing Strategy).
+    """
+
+    # -- visibility --
+
+    def test_button_and_feedback_gridded_only_in_replace_text_mode(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+
+        assert panel._advanced_editor_button.grid_info() == {}
+        assert panel._advanced_editor_feedback.grid_info() == {}
+
+        panel._on_mode_change("Replace text")
+
+        assert panel._advanced_editor_button.grid_info() != {}
+        assert panel._advanced_editor_feedback.grid_info() != {}
+
+    def test_button_and_feedback_absent_in_highlight_and_redact_modes(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+
+        panel._on_mode_change("Highlight text")
+        assert panel._advanced_editor_button.grid_info() == {}
+        assert panel._advanced_editor_feedback.grid_info() == {}
+
+        panel._on_mode_change("Redact text")
+        assert panel._advanced_editor_button.grid_info() == {}
+        assert panel._advanced_editor_feedback.grid_info() == {}
+
+    def test_leaving_replace_text_mode_hides_button_and_feedback(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+
+        panel._on_mode_change("Add text")
+
+        assert panel._advanced_editor_button.grid_info() == {}
+        assert panel._advanced_editor_feedback.grid_info() == {}
+
+    # -- enablement gated by source selection --
+
+    def test_button_starts_disabled(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+
+        assert panel._advanced_editor_button.cget("state") == "disabled"
+
+    def test_entering_replace_text_mode_without_source_keeps_button_disabled(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+
+        panel._on_mode_change("Replace text")
+
+        assert panel._advanced_editor_button.cget("state") == "disabled"
+
+    def test_entering_replace_text_mode_with_source_already_set_enables_button(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._source_row._path = Path("in.pdf")
+
+        panel._on_mode_change("Replace text")
+
+        assert panel._advanced_editor_button.cget("state") == "normal"
+
+    def test_on_source_change_enables_button_while_in_replace_text_mode(
+        self, tk_root: ctk.CTk
+    ) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        assert panel._advanced_editor_button.cget("state") == "disabled"
+
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+
+        assert panel._advanced_editor_button.cget("state") == "normal"
+
+    def test_on_source_change_to_none_disables_button(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+        assert panel._advanced_editor_button.cget("state") == "normal"
+
+        panel._source_row._path = None
+        panel._on_source_change(None)
+
+        assert panel._advanced_editor_button.cget("state") == "disabled"
+
+    # -- `_resolve_launch_page` --
+
+    def test_resolve_launch_page_blank_entry_defaults_to_one(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        # replace page entry intentionally left blank
+
+        assert panel._resolve_launch_page() == 1
+
+    def test_resolve_launch_page_invalid_entry_defaults_to_one(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._replace_page_entry.insert(0, "not-a-number")
+
+        assert panel._resolve_launch_page() == 1
+
+    def test_resolve_launch_page_valid_entry_is_parsed(self, tk_root: ctk.CTk) -> None:
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._replace_page_entry.insert(0, "7")
+
+        assert panel._resolve_launch_page() == 7
+
+    # -- `_launch_advanced_editor` --
+
+    def test_launch_with_no_source_is_a_defensive_no_op(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_popen = MagicMock(name="Popen")
+        monkeypatch.setattr(panels_module.subprocess, "Popen", mock_popen)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        # source intentionally left unset
+
+        panel._launch_advanced_editor()  # must not raise
+
+        mock_popen.assert_not_called()
+        assert panel._advanced_editor_feedback.cget("text") == ""
+
+    def test_launch_missing_pyside6_shows_message_and_does_not_spawn(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=None)
+        mock_popen = MagicMock(name="Popen")
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        monkeypatch.setattr(panels_module.subprocess, "Popen", mock_popen)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+
+        panel._launch_advanced_editor()
+
+        mock_find_spec.assert_called_once_with("PySide6")
+        mock_popen.assert_not_called()
+        assert (
+            panel._advanced_editor_feedback.cget("text") == panels_module._PYSIDE6_MISSING_MESSAGE
+        )
+
+    def test_launch_happy_path_spawns_detached_process_and_clears_feedback(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=object())
+        mock_popen = MagicMock(name="Popen")
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        monkeypatch.setattr(panels_module.subprocess, "Popen", mock_popen)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+        panel._replace_page_entry.insert(0, "3")
+        panel._advanced_editor_feedback.configure(text="stale message")
+
+        panel._launch_advanced_editor()
+
+        mock_popen.assert_called_once_with(
+            [sys.executable, "-m", "app.qt_editor", str(Path("in.pdf")), "--page", "3"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        assert panel._advanced_editor_feedback.cget("text") == ""
+
+    def test_launch_blank_page_entry_falls_back_to_page_one(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=object())
+        mock_popen = MagicMock(name="Popen")
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        monkeypatch.setattr(panels_module.subprocess, "Popen", mock_popen)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+        # replace page entry intentionally left blank
+
+        panel._launch_advanced_editor()
+
+        mock_popen.assert_called_once_with(
+            [sys.executable, "-m", "app.qt_editor", str(Path("in.pdf")), "--page", "1"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+    def test_launch_popen_oserror_shows_failure_message_without_raising(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=object())
+        mock_popen = MagicMock(name="Popen", side_effect=OSError("boom"))
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        monkeypatch.setattr(panels_module.subprocess, "Popen", mock_popen)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+
+        panel._launch_advanced_editor()  # must not raise
+
+        assert (
+            panel._advanced_editor_feedback.cget("text")
+            == panels_module._ADVANCED_EDITOR_LAUNCH_FAILED_MESSAGE
+        )
+
+    # -- regression guard: `_selection_feedback` isolation (design D6) --
+
+    def test_launch_success_does_not_touch_selection_feedback(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=object())
+        mock_popen = MagicMock(name="Popen")
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        monkeypatch.setattr(panels_module.subprocess, "Popen", mock_popen)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+        panel._selection_feedback.configure(text="Selected: 'kept as-is'")
+
+        panel._launch_advanced_editor()
+
+        assert panel._selection_feedback.cget("text") == "Selected: 'kept as-is'"
+
+    def test_launch_failure_does_not_touch_selection_feedback(
+        self, tk_root: ctk.CTk, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_find_spec = MagicMock(name="find_spec", return_value=None)
+        mock_popen = MagicMock(name="Popen")
+        monkeypatch.setattr(panels_module.importlib.util, "find_spec", mock_find_spec)
+        monkeypatch.setattr(panels_module.subprocess, "Popen", mock_popen)
+        panel = EditPanel(tk_root, output_suffix="_edited", output_ext=".pdf")
+        panel._on_mode_change("Replace text")
+        panel._source_row._path = Path("in.pdf")
+        panel._on_source_change(Path("in.pdf"))
+        panel._selection_feedback.configure(text="Selected: 'kept as-is'")
+
+        panel._launch_advanced_editor()
+
+        assert panel._selection_feedback.cget("text") == "Selected: 'kept as-is'"
