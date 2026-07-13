@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app.core.exceptions import ConfigError
+from app.infrastructure import config as config_module
 from app.infrastructure.config import ALL_ENV_KEYS, AppConfig
 
 
@@ -54,8 +55,12 @@ def test_load_succeeds_when_only_required_key_is_set(
 
 def test_load_raises_config_error_when_required_key_missing(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     _clear_config_env(monkeypatch)
+    # Point at a `.env` that doesn't exist so a real `.env` in the repo root
+    # (a normal local-dev artifact, gitignored) can't mask the missing key.
+    monkeypatch.setattr(config_module, "_DOTENV_PATH", tmp_path / ".env")
 
     with pytest.raises(ConfigError) as exc_info:
         AppConfig.load()
