@@ -27,7 +27,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSize  # noqa: E402 - must follow importorskip/env setup
 from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
+from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError  # noqa: E402
 from app.qt_editor.editor_window import AdvancedEditorWindow  # noqa: E402
+from app.ui.errors import error_message  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -102,6 +104,11 @@ class TestErrorHandling:
         central = window.centralWidget()
         assert isinstance(central, QLabel)
         assert "Could not open this page." in central.text()
+        # `_show_error` must route through the project's single
+        # exception-to-message resolver (`app.ui.errors.error_message`),
+        # never a raw exception message — this is `EntradaInvalidaError`'s
+        # resolved text, not `str(exc)`.
+        assert error_message(EntradaInvalidaError("anything")) in central.text()
 
     def test_render_corrupt_pdf_shows_error_label_instead_of_raising(
         self, qapp: QApplication, corrupt_pdf_factory: Callable[..., Path]
@@ -113,3 +120,7 @@ class TestErrorHandling:
         central = window.centralWidget()
         assert isinstance(central, QLabel)
         assert "Could not open this page." in central.text()
+        # Same resolver check for `PDFCorruptoError` — proves the routing
+        # is not accidentally correct for only one of the two caught
+        # exception types.
+        assert error_message(PDFCorruptoError("anything")) in central.text()

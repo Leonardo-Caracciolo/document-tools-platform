@@ -9,6 +9,12 @@ viewport-size guard (V1).
 
 Read-only: no editing, no save, no IPC to the parent process (slice 1
 non-requirements).
+
+`_render`'s in-window error state funnels through the same
+`app.ui.errors.error_message()` resolver the Tkinter surfaces use
+(`app/ui/widgets/panels.py`'s module docstring) — `error_message()` has
+zero customtkinter/tkinter dependency, so importing it here does not
+compromise this package's own zero-Tk-at-import-time goal.
 """
 
 from __future__ import annotations
@@ -29,9 +35,13 @@ from PySide6.QtWidgets import (
 
 from app.core.exceptions import EntradaInvalidaError, PDFCorruptoError
 from app.core.services.pdf_service import PDFService
+from app.ui.errors import error_message
 
 _FALLBACK_MAX_W = 1000
 _FALLBACK_MAX_H = 1300
+#: Fraction of the primary screen's available geometry the render box
+#: targets — see `_render_box`.
+_SCREEN_FRACTION = 0.9
 
 
 class AdvancedEditorWindow(QMainWindow):
@@ -53,13 +63,14 @@ class AdvancedEditorWindow(QMainWindow):
         self._render(pdf_path, page)
 
     def _render_box(self) -> tuple[int, int]:
-        """Return the (max_w, max_h) render box: 90% of the primary
-        screen's available geometry, or the fallback box when no screen
-        is available or the computed box is non-positive."""
+        """Return the (max_w, max_h) render box: `_SCREEN_FRACTION` of the
+        primary screen's available geometry, or the fallback box when no
+        screen is available or the computed box is non-positive."""
         screen = QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
-            w, h = int(avail.width() * 0.9), int(avail.height() * 0.9)
+            w = int(avail.width() * _SCREEN_FRACTION)
+            h = int(avail.height() * _SCREEN_FRACTION)
             if w > 0 and h > 0:
                 return w, h
         return _FALLBACK_MAX_W, _FALLBACK_MAX_H
@@ -69,7 +80,7 @@ class AdvancedEditorWindow(QMainWindow):
         try:
             result = PDFService().render_page(pdf_path, page, max_w, max_h)
         except (EntradaInvalidaError, PDFCorruptoError) as exc:
-            self._show_error(str(exc))
+            self._show_error(error_message(exc))
             return
         qimage = ImageQt(result.image)
         pixmap = QPixmap.fromImage(qimage)
