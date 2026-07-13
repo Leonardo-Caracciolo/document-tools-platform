@@ -883,6 +883,28 @@ class TestAnchorPoint:
 
         assert point == pytest.approx((306 - self._WIDTH / 2, 396))
 
+    def test_top_right_measures_width_with_the_passed_in_font_not_the_fixed_default(
+        self,
+    ) -> None:
+        """`_anchor_point` gained `fontname`/`fontsize` specifically so
+        right/center alignment measures width with whatever font is
+        actually being used, not always `helv`/11 — this proves that
+        effect, not just that the parameters exist and get threaded
+        through. `pymupdf.get_text_length("Hi", "Times-Roman", 18)` ==
+        18.0 exactly (verified empirically, independent of `_WIDTH`
+        above's helv/11 measurement), so passing a different font/size
+        must produce a genuinely different point than `test_top_right`'s."""
+        service = PDFService()
+        times_18_width = 18.0
+        # top = rect.y0 + margin + fontsize (baseline sits one fontsize
+        # below the margin line) -- fontsize=18 here, not the _FONTSIZE=11
+        # this class's other tests use, so the y differs too (54, not 47).
+
+        point = service._anchor_point("top-right", self._RECT, self._TEXT, "Times-Roman", 18)
+
+        assert point == pytest.approx((612 - 36 - times_18_width, 0 + 36 + 18))
+        assert point[0] != pytest.approx(612 - 36 - self._WIDTH)
+
     def test_bottom_is_a_larger_y_than_top_matching_pymupdfs_y_grows_down_origin(
         self,
     ) -> None:
@@ -1135,6 +1157,47 @@ class TestAddText:
             assert found is not None
             assert found["font"] == "Times-Roman"
             assert found["size"] == pytest.approx(14.0)
+        finally:
+            doc.close()
+
+    def test_add_text_right_alignment_measures_width_with_the_detected_font(
+        self, tmp_path: Path, valid_pdf_factory: Callable[..., Path]
+    ) -> None:
+        """Regression for the WARNING in this PR's review: the two tests
+        above only use `position="top-left"`, which never exercises
+        `_anchor_point`'s width-measurement branch (`top-left` needs no
+        text width, only `rect.x0 + margin`). `top-right` DOES need it —
+        this proves the detected `Times-Roman`/14 font/size, not the
+        fixed `helv`/11 default, is what `add_text` actually measures
+        with when placing right-aligned text end-to-end."""
+        source = valid_pdf_factory("doc.pdf", pages=1)
+        service = PDFService()
+        seeded = tmp_path / "seeded.pdf"
+        doc = pymupdf.open(source)
+        try:
+            doc.load_page(0).insert_text(
+                (72, 300), "Existing body text", fontname="Times-Roman", fontsize=14
+            )
+            doc.save(seeded)
+        finally:
+            doc.close()
+        output = tmp_path / "edited.pdf"
+
+        service.add_text(seeded, output, page=1, text="Anchor marker", position="top-right")
+
+        doc = pymupdf.open(output)
+        try:
+            found = self._find_span(doc, "Anchor marker")
+            assert found is not None
+            assert found["font"] == "Times-Roman"
+            assert found["size"] == pytest.approx(14.0)
+            # pymupdf.get_text_length("Anchor marker", "Times-Roman", 14)
+            # == 85.134... (verified empirically) -- if add_text measured
+            # with the fixed helv/11 default instead (width 72.127...),
+            # this x0 would be off by ~13pt, well outside the tolerance.
+            times_14_width = 85.13400042057037
+            expected_x0 = 612 - 36 - times_14_width
+            assert found["bbox"][0] == pytest.approx(expected_x0, abs=1)
         finally:
             doc.close()
 
@@ -1629,6 +1692,36 @@ class TestReplaceText:
         with pytest.raises(EntradaInvalidaError, match="5"):
             service.replace_text(
                 source, tmp_path / "replaced.pdf", page=5, span=span, replacement="y"
+            )
+
+    def test_replace_text_raises_entrada_invalida_for_empty_source(
+        self, tmp_path: Path, empty_file_factory: Callable[..., Path]
+    ) -> None:
+        source = empty_file_factory("empty.pdf")
+        service = PDFService()
+        span = SpanInfo(
+            text="x", bbox=(0, 0, 10, 10), origin=(0, 10), font="Helvetica", size=11,
+            color=(0, 0, 0),
+        )
+
+        with pytest.raises(EntradaInvalidaError):
+            service.replace_text(
+                source, tmp_path / "replaced.pdf", page=1, span=span, replacement="y"
+            )
+
+    def test_replace_text_raises_pdf_corrupto_for_corrupt_source(
+        self, tmp_path: Path, corrupt_pdf_factory: Callable[..., Path]
+    ) -> None:
+        source = corrupt_pdf_factory("corrupt.pdf")
+        service = PDFService()
+        span = SpanInfo(
+            text="x", bbox=(0, 0, 10, 10), origin=(0, 10), font="Helvetica", size=11,
+            color=(0, 0, 0),
+        )
+
+        with pytest.raises(PDFCorruptoError):
+            service.replace_text(
+                source, tmp_path / "replaced.pdf", page=1, span=span, replacement="y"
             )
 
     def test_replace_text_stale_span_still_executes_without_crash(
