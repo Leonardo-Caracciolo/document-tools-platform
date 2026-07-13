@@ -538,14 +538,23 @@ class EditPanel(InputPanel):
     def _active_page_entry(self) -> ctk.CTkEntry:
         """Return whichever group's page entry is live for `self._mode`.
 
-        `add_text` and `replace_text` each own a distinct page entry
-        (`_add_page_entry`/`_replace_page_entry`) — the preview render
-        and any subsequent `find_span_at_point` call must always agree
-        on which page is showing, so both `_refresh_preview` and
-        `_on_preview_point` resolve the page through this single helper.
+        Each mode owns a distinct page entry widget — `add_text`'s
+        `_add_page_entry`, `replace_text`'s `_replace_page_entry`, and
+        `highlight_text`/`redact_text`'s shared `_search_page_entry` (the
+        preview isn't currently gridded in those last two modes, but this
+        mapping is genuinely mode-complete rather than silently falling
+        through to `_add_page_entry` for them — a reader must not have to
+        re-derive which entry is "really" live per mode). Used by
+        `_refresh_preview` so the rendered page always matches whichever
+        entry the active mode actually shows — `_on_preview_point`'s
+        `replace_text` branch reads `_replace_page_entry` directly instead
+        (that branch only ever runs in `replace_text` mode by construction,
+        so there's no mode ambiguity to resolve there).
         """
         if self._mode == "replace_text":
             return self._replace_page_entry
+        if self._mode in ("highlight_text", "redact_text"):
+            return self._search_page_entry
         return self._add_page_entry
 
     def _refresh_preview(self) -> None:
