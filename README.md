@@ -5,8 +5,15 @@ Suite de utilidades PDF de escritorio para Windows, construida con Python y `cus
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 
+## Acerca de
+
+Acrobat Tools V2.0 es, por ahora, un proyecto personal, pensado para evolucionar hacia un uso profesional. La idea de fondo es contar con una suite de herramientas PDF que resguarde y mantenga bajo control propio la información de los documentos, en lugar de depender de servicios online de terceros para operaciones sensibles (editar, proteger, convertir).
+
+Hoy el reconocimiento de texto (OCR) corre de forma local con Tesseract. El plan a futuro es incorporar la IA de Azure (Azure OCR / Azure Document Intelligence) como proveedor alternativo — la arquitectura ya está preparada para esto: `OCRService` y `ExportService` seleccionan su proveedor mediante las variables de entorno `OCR_PROVIDER`/`DOC_CONVERTER_PROVIDER` (ver [Arquitectura](#arquitectura)), por lo que sumar un proveedor Azure no requeriría rediseñar la capa de servicios.
+
 ## Tabla de contenidos
 
+- [Acerca de](#acerca-de)
 - [Funcionalidades](#funcionalidades)
 - [Arquitectura](#arquitectura)
 - [Requisitos](#requisitos)
