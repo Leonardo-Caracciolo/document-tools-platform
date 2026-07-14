@@ -188,7 +188,9 @@ tests/
 ## Contribuir
 
 - Los mensajes de commit siguen [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `test:`, `chore:`, `docs:`), consistente con el historial de este repositorio.
-- Correr tests y lint antes de commitear:
+- Cada funcionalidad o cambio se desarrolla en su propia rama, creada desde `master`, con el prefijo correspondiente al tipo de cambio: `feat/<nombre>`, `fix/<nombre>`, `docs/<nombre>`, `chore/<nombre>`, `test/<nombre>` — por ejemplo `feat/qt-editor-slice3`.
+- `master` está protegida: no se pushea directo. Todo cambio entra vía Pull Request, que debe pasar el workflow de CI (`.github/workflows/ci.yml`, lint + tests) antes de poder mergearse.
+- Correr tests y lint antes de abrir el PR:
 
 ```powershell
 python -m pytest tests/unit -q
